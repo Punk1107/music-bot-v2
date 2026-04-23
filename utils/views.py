@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Optional, Callable, Awaitable
 
 import discord
 
-from utils.embeds import error_embed, success_embed, info_embed, queue_embed
+from utils.embeds import error_embed, success_embed, info_embed, queue_embed, now_playing_embed
 
 if TYPE_CHECKING:
     from main import MusicBot
@@ -266,12 +266,29 @@ class MusicControlView(discord.ui.View):
             except AttributeError:
                 pass
         self._sync_buttons()
-        await interaction.response.edit_message(view=self)
-        # Ephemeral confirmation so chat stays clean
-        await interaction.followup.send(
-            embed=success_embed("Volume", f"🔉 Set to **{int(new_vol * 100)}%**."),
-            ephemeral=True,
-        )
+        # Rebuild the Now Playing embed with the updated volume, then edit in-place
+        guild = self.bot.get_guild(self.guild_id)
+        requester_member: Optional[discord.Member] = None
+        if player.now_playing and player.now_playing.requester_id and guild:
+            requester_member = guild.get_member(player.now_playing.requester_id)
+        if player.now_playing:
+            embed = now_playing_embed(
+                player.now_playing,
+                elapsed      = player.elapsed_seconds(),
+                requester    = requester_member,
+                loop_label   = player.loop_mode.label(),
+                loop_short   = player.loop_mode.short_label(),
+                effects      = [e.display_name for e in player.effects],
+                volume       = player.volume,
+                quality      = player.quality,
+                queue_count  = len(player),
+                queue_dur    = player.queue_duration(),
+                channel_name = player.now_playing.uploader or "",
+                accent_color = player.accent_color,
+            )
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(view=self)
 
     @discord.ui.button(
         label="🔊 Vol +10%",
@@ -294,11 +311,29 @@ class MusicControlView(discord.ui.View):
             except AttributeError:
                 pass
         self._sync_buttons()
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send(
-            embed=success_embed("Volume", f"🔊 Set to **{int(new_vol * 100)}%**."),
-            ephemeral=True,
-        )
+        # Rebuild the Now Playing embed with the updated volume, then edit in-place
+        guild = self.bot.get_guild(self.guild_id)
+        requester_member: Optional[discord.Member] = None
+        if player.now_playing and player.now_playing.requester_id and guild:
+            requester_member = guild.get_member(player.now_playing.requester_id)
+        if player.now_playing:
+            embed = now_playing_embed(
+                player.now_playing,
+                elapsed      = player.elapsed_seconds(),
+                requester    = requester_member,
+                loop_label   = player.loop_mode.label(),
+                loop_short   = player.loop_mode.short_label(),
+                effects      = [e.display_name for e in player.effects],
+                volume       = player.volume,
+                quality      = player.quality,
+                queue_count  = len(player),
+                queue_dur    = player.queue_duration(),
+                channel_name = player.now_playing.uploader or "",
+                accent_color = player.accent_color,
+            )
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(view=self)
 
 
 # ── Search result select ──────────────────────────────────────────────────────
