@@ -7,7 +7,7 @@ V3 Changes:
   - Self-healing _try_reconnect() on unexpected voice disconnect
   - Dynamic embed accent color from thumbnail via color_thief.get_dominant_color()
   - All player queue mutations use new async methods (enqueue, dequeue, etc.)
-  - track_added_embed uses delete_after=20s when queued (not first track)
+  - track_added_embed confirmation messages persist permanently (no auto-delete)
   - voice_connection_error_embed for reconnect failure notification
 """
 
@@ -39,17 +39,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def _delete_after(msg: discord.WebhookMessage, delay: float) -> None:
-    """Delete a WebhookMessage after *delay* seconds (fire-and-forget helper).
 
-    Webhook.send() does not accept delete_after, so we schedule deletion
-    manually via asyncio.create_task(_delete_after(msg, secs)).
-    """
-    await asyncio.sleep(delay)
-    try:
-        await msg.delete()
-    except Exception:
-        pass  # Message already gone — ignore silently
 
 
 class MusicCog(commands.Cog, name="Music"):
@@ -604,7 +594,7 @@ class MusicCog(commands.Cog, name="Music"):
             await player.enqueue(track)
             pos = len(player)
             is_first = not vc.is_playing() and not vc.is_paused()
-            _msg = await interaction.followup.send(
+            await interaction.followup.send(
                 embed=track_added_embed(
                     track, pos,
                     requester    = interaction.user,
@@ -613,10 +603,7 @@ class MusicCog(commands.Cog, name="Music"):
                     queue_dur    = player.queue_duration(),
                     is_first     = is_first,
                 ),
-                wait=True,
             )
-            if not is_first:
-                asyncio.create_task(_delete_after(_msg, 20.0))
 
         # ── Search query ────────────────────────────────────────────────────────
         else:
@@ -639,7 +626,7 @@ class MusicCog(commands.Cog, name="Music"):
             await player.enqueue(track)
             pos = len(player)
             is_first = not vc.is_playing() and not vc.is_paused()
-            _msg = await interaction.followup.send(
+            await interaction.followup.send(
                 embed=track_added_embed(
                     track, pos,
                     requester    = interaction.user,
@@ -648,10 +635,7 @@ class MusicCog(commands.Cog, name="Music"):
                     queue_dur    = player.queue_duration(),
                     is_first     = is_first,
                 ),
-                wait=True,
             )
-            if not is_first:
-                asyncio.create_task(_delete_after(_msg, 20.0))
 
         # Save search query to history for autocomplete — fire-and-forget with error logging
         if not query.startswith("http"):
@@ -714,7 +698,7 @@ class MusicCog(commands.Cog, name="Music"):
             await player.enqueue(track)
             pos = len(player)
             is_first = not vc.is_playing() and not vc.is_paused()
-            _msg = await interaction.followup.send(
+            await interaction.followup.send(
                 embed=track_added_embed(
                     track, pos,
                     requester    = interaction.user,
@@ -723,10 +707,7 @@ class MusicCog(commands.Cog, name="Music"):
                     queue_dur    = player.queue_duration(),
                     is_first     = is_first,
                 ),
-                wait=True,
             )
-            if not is_first:
-                asyncio.create_task(_delete_after(_msg, 20.0))
             if is_first:
                 await self._play_next(interaction.guild_id)
 

@@ -2,12 +2,16 @@
 """
 utils/embeds.py — Discord embed factories.
 
-All embed colours come from config so they stay consistent across the bot.
-
-V3 Changes:
-  - now_playing_embed() accepts accent_color kwarg for dynamic thumbnail color
-  - Falls back gracefully to config.COLOR_NOW_PLAYING when accent_color is None
-  - All other embeds unchanged
+V4 Changes:
+  - now_playing_embed() completely redesigned as a modern music-player
+    dashboard: image banner, two clean inline field rows, a styled progress
+    bar with timestamps, volume bar, loop badge — all driven by dynamic
+    accent colour extracted from the thumbnail.
+  - track_added_embed() upgraded with a gradient feel: banner thumbnail,
+    refined inline field layout, distinct accent stripe.
+  - Generic embeds (success/error/info/warning) gain a subtle emoji-prefix
+    and use rounded colours that feel premium.
+  - All fallback paths preserved so nothing breaks when optional data is None.
 """
 
 from __future__ import annotations
@@ -22,33 +26,55 @@ from models.track import Track
 from utils.formatters import fmt_duration, fmt_views, progress_bar, truncate
 
 
+# ── Volume-bar helper ─────────────────────────────────────────────────────────
+
+def _volume_bar(volume: float, length: int = 10) -> str:
+    """Render a compact visual volume bar: e.g. '▮▮▮▮▮▯▯▯▯▯ 50%'"""
+    pct   = int(round(volume * 100))
+    filled = round(volume * length)       # volume is 0.0–2.0; cap display at 1.0
+    display_filled = round(min(volume, 1.0) * length)
+    bar   = "▮" * display_filled + "▯" * (length - display_filled)
+    return f"`{bar}` **{pct}%**"
+
+
+# ── Loop-badge helper ─────────────────────────────────────────────────────────
+
+def _loop_badge(loop_short: str) -> str:
+    badges = {
+        "Off":   "⬜ Off",
+        "Track": "🟩 Track",
+        "Queue": "🟦 Queue",
+    }
+    return badges.get(loop_short, loop_short)
+
+
 # ── Generic ───────────────────────────────────────────────────────────────────
 
 def success_embed(title: str, description: str = "") -> discord.Embed:
-    e = discord.Embed(title=f"✅ {title}", description=description, colour=config.COLOR_SUCCESS)
+    e = discord.Embed(title=f"✅  {title}", description=description, colour=0x2ECC71)
     e.timestamp = datetime.now(timezone.utc)
     return e
 
 
 def error_embed(title: str, description: str = "") -> discord.Embed:
-    e = discord.Embed(title=f"❌ {title}", description=description, colour=config.COLOR_ERROR)
+    e = discord.Embed(title=f"❌  {title}", description=description, colour=0xE74C3C)
     e.timestamp = datetime.now(timezone.utc)
     return e
 
 
 def info_embed(title: str, description: str = "") -> discord.Embed:
-    e = discord.Embed(title=f"ℹ️ {title}", description=description, colour=config.COLOR_INFO)
+    e = discord.Embed(title=f"ℹ️  {title}", description=description, colour=0x3498DB)
     e.timestamp = datetime.now(timezone.utc)
     return e
 
 
 def warning_embed(title: str, description: str = "") -> discord.Embed:
-    e = discord.Embed(title=f"⚠️ {title}", description=description, colour=config.COLOR_WARNING)
+    e = discord.Embed(title=f"⚠️  {title}", description=description, colour=0xF39C12)
     e.timestamp = datetime.now(timezone.utc)
     return e
 
 
-# ── Music-specific ────────────────────────────────────────────────────────────
+# ── Now Playing ───────────────────────────────────────────────────────────────
 
 def now_playing_embed(
     track: Track,
@@ -63,78 +89,147 @@ def now_playing_embed(
     queue_count:  int = 0,
     queue_dur:    int = 0,
     channel_name: str = "",
-    accent_color: Optional[int] = None,   # ← dynamic thumbnail color
+    accent_color: Optional[int] = None,
 ) -> discord.Embed:
-    bar = progress_bar(elapsed, track.duration)
-
-    # Use dynamic accent color if provided, otherwise fall back to config default
     color = accent_color if accent_color is not None else config.COLOR_NOW_PLAYING
 
+    # ── Header ────────────────────────────────────────────────────────────────
+    # Title row shows the track link; description carries the channel name
+    channel_line = f"📺 *{truncate(channel_name, 40)}*\n" if channel_name else ""
     e = discord.Embed(
-        title       = "🎵 Now Playing",
-        description = f"**[{truncate(track.title, 80)}]({track.url})**",
         colour      = color,
+        description = (
+            f"### 🎵  [{truncate(track.title, 75)}]({track.url})\n"
+            f"{channel_line}"
+        ),
+    )
+
+    # Large thumbnail on the right side
+    if track.thumbnail:
+        e.set_thumbnail(url=track.thumbnail)
+
+    # ── Row 1: Duration | Views | Queue ──────────────────────────────────────
+    e.add_field(
+        name  = "⏱  Duration",
+        value = f"`{fmt_duration(track.duration)}`",
+        inline= True,
+    )
+    e.add_field(
+        name  = "👁  Views",
+        value = f"`{fmt_views(track.view_count)}`",
+        inline= True,
+    )
+    queue_value = (
+        f"`{queue_count} track{'s' if queue_count != 1 else ''}`"
+        + (f"\n`{fmt_duration(queue_dur)} remaining`" if queue_dur else "")
+    )
+    e.add_field(name="📋  In Queue", value=queue_value, inline=True)
+
+    # ── Row 2: Requested by | Loop | Quality ─────────────────────────────────
+    if requester:
+        e.add_field(
+            name  = "👤  Requested by",
+            value = requester.mention,
+            inline= True,
+        )
+    e.add_field(
+        name  = "🔁  Loop",
+        value = _loop_badge(loop_short),
+        inline= True,
+    )
+    e.add_field(
+        name  = "🎚  Quality",
+        value = f"`{quality}`",
+        inline= True,
+    )
+
+    # ── Row 3: Volume bar (full width) ────────────────────────────────────────
+    vol_line = _volume_bar(volume)
+    effects_line = (
+        f"\n> 🎛  **Effects:** {', '.join(effects)}"
+        if effects else ""
+    )
+    e.add_field(
+        name  = "🔊  Volume",
+        value = vol_line + effects_line,
+        inline= False,
+    )
+
+    # ── Progress bar (full width) ─────────────────────────────────────────────
+    bar = progress_bar(elapsed, track.duration)
+    e.add_field(
+        name  = "▶  Progress",
+        value = f"```{bar}```",
+        inline= False,
+    )
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    footer_text = "Music Bot V2  •  Now Playing"
+    if requester:
+        e.set_footer(text=footer_text, icon_url=requester.display_avatar.url)
+    else:
+        e.set_footer(text=footer_text)
+
+    e.timestamp = datetime.now(timezone.utc)
+    return e
+
+
+# ── Track Added ───────────────────────────────────────────────────────────────
+
+def track_added_embed(
+    track: Track,
+    position: int,
+    *,
+    requester:    Optional[discord.Member] = None,
+    channel_name: str = "",
+    queue_count:  int = 0,
+    queue_dur:    int = 0,
+    is_first:     bool = False,
+) -> discord.Embed:
+    # Vivid accent: teal for "playing now", violet for "queued"
+    colour = 0x1ABC9C if is_first else 0x9B59B6
+    icon   = "▶️" if is_first else "➕"
+    label  = "Playing Now" if is_first else "Added to Queue"
+
+    channel_line = f"📺 *{truncate(channel_name, 40)}*\n" if channel_name else ""
+    e = discord.Embed(
+        colour      = colour,
+        description = (
+            f"### {icon}  {label}\n"
+            f"**[{truncate(track.title, 70)}]({track.url})**\n"
+            f"{channel_line}"
+        ),
     )
 
     if track.thumbnail:
         e.set_thumbnail(url=track.thumbnail)
 
-    # Row 1 — Duration | Requested by | Channel
-    e.add_field(
-        name="⏱ Duration",
-        value=fmt_duration(track.duration),
-        inline=True,
-    )
+    # ── Row 1: Duration | Views | Position ───────────────────────────────────
+    e.add_field(name="⏱  Duration",  value=f"`{fmt_duration(track.duration)}`", inline=True)
+    e.add_field(name="👁  Views",     value=f"`{fmt_views(track.view_count)}`",  inline=True)
+    pos_str = "▶ Up next" if is_first else f"#{position}"
+    e.add_field(name="📌  Position",  value=f"`{pos_str}`",                     inline=True)
+
+    # ── Row 2: Requested by | Queue ──────────────────────────────────────────
     if requester:
-        e.add_field(
-            name="👤 Requested by",
-            value=f"{requester.mention}",
-            inline=True,
-        )
-    if channel_name:
-        e.add_field(
-            name="📺 Channel",
-            value=channel_name,
-            inline=True,
-        )
+        e.add_field(name="👤  Requested by", value=requester.mention, inline=True)
 
-    # Row 2 — Views | Queue | Loop
-    e.add_field(
-        name="👁 Views",
-        value=fmt_views(track.view_count),
-        inline=True,
-    )
-    queue_value = (
-        f"{queue_count} track{'s' if queue_count != 1 else ''}"
-        + (f" • {fmt_duration(queue_dur)}" if queue_dur else " • Live")
-    )
-    e.add_field(name="📋 Queue", value=queue_value, inline=True)
-    e.add_field(name="🔁 Loop", value=loop_short, inline=True)
+    queue_value = f"`{queue_count} track{'s' if queue_count != 1 else ''}`"
+    if queue_dur:
+        queue_value += f"\n`{fmt_duration(queue_dur)} total`"
+    e.add_field(name="📋  Queue", value=queue_value, inline=True)
 
-    # Row 3 — Settings (Volume + Quality) spanning full width
-    settings_value = f"Volume: {int(volume * 100)}% • Quality: {quality}"
-    if effects:
-        settings_value += f" • Effects: {', '.join(effects)}"
-    e.add_field(name="⚙ Settings", value=settings_value, inline=False)
-
-    # Progress bar
-    e.add_field(
-        name  = "🎶 Progress",
-        value = f"`{bar}`",
-        inline= False,
-    )
-
+    footer_text = "Music Bot V2  •  Track Queued"
     if requester:
-        e.set_footer(
-            text     = "Music Bot V2",
-            icon_url = requester.display_avatar.url,
-        )
+        e.set_footer(text=footer_text, icon_url=requester.display_avatar.url)
     else:
-        e.set_footer(text="Music Bot V2")
+        e.set_footer(text=footer_text)
 
     e.timestamp = datetime.now(timezone.utc)
     return e
 
+
+# ── Queue ─────────────────────────────────────────────────────────────────────
 
 def queue_embed(
     tracks: list[Track],
@@ -145,117 +240,70 @@ def queue_embed(
     per_page:         int = 10,
     total_duration:   int = 0,
 ) -> discord.Embed:
-    total_pages = max(1, -(-len(tracks) // per_page))  # ceiling division
+    total_pages = max(1, -(-len(tracks) // per_page))
     start = (page - 1) * per_page
     chunk = tracks[start: start + per_page]
 
     e = discord.Embed(
-        title       = f"📋 Queue — {guild_name}",
-        colour      = config.COLOR_PRIMARY,
-        timestamp   = datetime.now(timezone.utc),
+        title     = f"📋  Queue — {guild_name}",
+        colour    = 0x5865F2,
+        timestamp = datetime.now(timezone.utc),
     )
 
     if now_playing:
         e.add_field(
-            name  = "🎵 Now Playing",
+            name  = "🎵  Now Playing",
             value = f"**{truncate(now_playing.title, 60)}** `{fmt_duration(now_playing.duration)}`",
             inline= False,
         )
 
     if not chunk:
-        e.description = "_The queue is empty._"
+        e.description = "*The queue is empty.*"
     else:
         lines = []
         for i, t in enumerate(chunk, start=start + 1):
-            lines.append(f"`{i}.` {truncate(t.title, 55)} `{fmt_duration(t.duration)}`")
+            lines.append(f"`{i:>2}.` **{truncate(t.title, 52)}** `{fmt_duration(t.duration)}`")
         e.description = "\n".join(lines)
 
     e.set_footer(
         text=(
-            f"Page {page}/{total_pages} · "
-            f"{len(tracks)} track{'s' if len(tracks) != 1 else ''} · "
+            f"Page {page}/{total_pages}  ·  "
+            f"{len(tracks)} track{'s' if len(tracks) != 1 else ''}  ·  "
             f"Total: {fmt_duration(total_duration)}"
         )
     )
     return e
 
 
+# ── Search Results ────────────────────────────────────────────────────────────
+
 def search_results_embed(tracks: list[Track], query: str) -> discord.Embed:
     e = discord.Embed(
-        title       = f"🔍 Search: {truncate(query, 50)}",
+        title       = f"🔍  Search: {truncate(query, 50)}",
         description = "Select a track from the dropdown below.",
-        colour      = config.COLOR_INFO,
+        colour      = 0x3498DB,
         timestamp   = datetime.now(timezone.utc),
     )
     lines = []
     for i, t in enumerate(tracks[:10], 1):
         lines.append(
-            f"`{i}.` **{truncate(t.title, 60)}**  ·  "
-            f"`{fmt_duration(t.duration)}`  ·  {t.uploader}"
+            f"`{i}.` **{truncate(t.title, 55)}**\n"
+            f"    └ `{fmt_duration(t.duration)}`  ·  *{truncate(t.uploader, 30)}*"
         )
-    e.add_field(name="Results", value="\n".join(lines) or "_No results found._", inline=False)
+    e.add_field(name="Results", value="\n".join(lines) or "*No results found.*", inline=False)
     return e
 
 
-def track_added_embed(
-    track: Track,
-    position: int,
-    *,
-    requester:    Optional[discord.Member] = None,
-    channel_name: str = "",
-    queue_count:  int = 0,
-    queue_dur:    int = 0,
-    is_first:     bool = False,   # True when this track starts playing immediately
-) -> discord.Embed:
-    # Dynamic title: distinguish "playing now" from "queued"
-    title  = "▶ Now Playing" if is_first else "➕ Added to Queue"
-    colour = config.COLOR_NOW_PLAYING if is_first else config.COLOR_SUCCESS
-
-    e = discord.Embed(
-        title       = title,
-        description = f"**[{truncate(track.title, 70)}]({track.url})**",
-        colour      = colour,
-    )
-    if track.thumbnail:
-        e.set_thumbnail(url=track.thumbnail)
-
-    # Row 1 — Duration | Requested by | Channel
-    e.add_field(name="⏱ Duration", value=fmt_duration(track.duration), inline=True)
-    if requester:
-        e.add_field(name="👤 Requested by", value=requester.mention, inline=True)
-    if channel_name:
-        e.add_field(name="📺 Channel", value=channel_name, inline=True)
-
-    # Row 2 — Views | Queue | Position
-    e.add_field(name="👁 Views",    value=fmt_views(track.view_count), inline=True)
-    queue_value = (
-        f"{queue_count} track{'s' if queue_count != 1 else ''}"
-        + (f" • {fmt_duration(queue_dur)}" if queue_dur else "")
-    )
-    e.add_field(name="📋 Queue",    value=queue_value, inline=True)
-    pos_str = "▶ Up next" if is_first else f"#{position}"
-    e.add_field(name="📌 Position", value=pos_str, inline=True)
-
-    if requester:
-        e.set_footer(
-            text     = "Music Bot V2",
-            icon_url = requester.display_avatar.url,
-        )
-    else:
-        e.set_footer(text="Music Bot V2")
-
-    e.timestamp = datetime.now(timezone.utc)
-    return e
-
+# ── History ───────────────────────────────────────────────────────────────────
 
 def history_embed(entries: list[dict], guild_name: str = "") -> discord.Embed:
     e = discord.Embed(
-        title     = f"📜 Play History — {guild_name}",
-        colour    = config.COLOR_INFO,
+        title     = f"📜  Play History — {guild_name}",
+        colour    = 0x3498DB,
         timestamp = datetime.now(timezone.utc),
     )
     if not entries:
-        e.description = "_No play history yet._"
+        e.description = "*No play history yet.*"
         return e
     lines = []
     for item in entries:
@@ -266,16 +314,18 @@ def history_embed(entries: list[dict], guild_name: str = "") -> discord.Embed:
     return e
 
 
+# ── Help ──────────────────────────────────────────────────────────────────────
+
 def help_embed() -> discord.Embed:
     e = discord.Embed(
-        title       = "🎵 Music Bot V2 — Commands",
+        title       = "🎵  Music Bot V2 — Commands",
         description = "All commands use Discord slash commands (`/`)",
-        colour      = config.COLOR_PRIMARY,
+        colour      = 0x5865F2,
         timestamp   = datetime.now(timezone.utc),
     )
 
     e.add_field(
-        name  = "🎶 Playback",
+        name  = "🎶  Playback",
         value = (
             "`/join` · `/leave`\n"
             "`/play <query|URL>` · `/search <query>`\n"
@@ -284,7 +334,7 @@ def help_embed() -> discord.Embed:
         inline=False,
     )
     e.add_field(
-        name  = "📋 Queue",
+        name  = "📋  Queue",
         value = (
             "`/queue [page]` · `/shuffle` · `/clear`\n"
             "`/loop` · `/remove <position>` · `/move <from> <to>`"
@@ -292,14 +342,14 @@ def help_embed() -> discord.Embed:
         inline=False,
     )
     e.add_field(
-        name  = "🎛 Audio",
+        name  = "🎛  Audio",
         value = "`/volume <0-200>` · `/effects <effect>` · `/effects_clear` · `/effects_list`",
         inline=False,
     )
     e.add_field(
-        name  = "📊 Info",
+        name  = "📊  Info",
         value = "`/nowplaying` · `/history` · `/stats` · `/help`",
         inline=False,
     )
-    e.set_footer(text="Music Bot V2 — Use /help for this menu at any time.")
+    e.set_footer(text="Music Bot V2  —  Use /help for this menu at any time.")
     return e
