@@ -352,7 +352,7 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="join", description="Join your voice channel.")
     async def join(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not interaction.user.voice:
             await interaction.followup.send(
                 embed=error_embed("Not in Voice Channel",
@@ -367,7 +367,6 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.followup.send(
                 embed=success_embed("Connected",
                                     f"Joined **{vc.channel.name}**."),
-                ephemeral=True,
             )
 
     @app_commands.command(name="leave", description="Leave the voice channel and clear the queue.")
