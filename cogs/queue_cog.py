@@ -60,7 +60,7 @@ class QueueCog(commands.Cog, name="Queue"):
             guild_name = interaction.guild.name,
         )
         view.page = max(1, page)
-        embed = view._build_embed()
+        embed = view.build_embed()
         await interaction.response.send_message(embed=embed, view=view)
 
     @app_commands.command(name="shuffle", description="Shuffle the queue randomly.")

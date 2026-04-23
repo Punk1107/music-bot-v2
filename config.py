@@ -52,11 +52,15 @@ YTDL_AUDIO_FORMAT: str   = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/bes
 SKIP_ERROR_LIMIT: int    = 5    # max consecutive broken tracks before stopping
 
 # ── Embed colours ────────────────────────────────────────────────────────────
-COLOR_PRIMARY   = 0x5865F2   # Blurple
-COLOR_SUCCESS   = 0x57F287   # Green
-COLOR_WARNING   = 0xFEE75C   # Yellow
-COLOR_ERROR     = 0xED4245   # Red
-COLOR_INFO      = 0x5865F2   # Blurple
+COLOR_PRIMARY     = 0x5865F2   # Blurple  — general / primary
+COLOR_SUCCESS     = 0x57F287   # Green    — confirmations
+COLOR_WARNING     = 0xFEE75C   # Yellow   — warnings
+COLOR_ERROR       = 0xED4245   # Red      — errors
+COLOR_INFO        = 0x00B4D8   # Cyan     — informational (distinct from primary)
+COLOR_NOW_PLAYING = 0x9B59B6   # Purple   — now-playing embed (stands out in chat)
+
+# ── Progress bar ──────────────────────────────────────────────────────────────
+PROGRESS_BAR_UPDATE_INTERVAL: int = 7   # seconds between now-playing edits
 
 # ── Extra banned domains from env (comma-separated) ──────────────────────────
 EXTRA_BANNED_DOMAINS: list[str] = [

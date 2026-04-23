@@ -1,17 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 utils/views.py — Discord UI Views (Buttons, Selects) for the music bot.
+
+V2.1 Changes:
+  - MusicControlView._check() guards against user.voice being None (AttributeError fix)
+  - pause/resume button uses ButtonStyle.success (green) when paused for visual affordance
+  - skip/shuffle/stop buttons respond with proper embeds, not plain strings
+  - Loop button uses LoopMode.label() from the model — no fragile dict mapping
+  - SearchSelectView wraps callback in try/except to catch closure errors
+  - QueueView._build_embed() renamed to build_embed() (public API)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Callable, Awaitable
 
 import discord
 
-from utils.embeds import error_embed, queue_embed
+from utils.embeds import error_embed, success_embed, info_embed, queue_embed
 
 if TYPE_CHECKING:
     from main import MusicBot
@@ -39,7 +47,7 @@ class MusicControlView(discord.ui.View):
         return guild.voice_client if guild else None
 
     async def _check(self, interaction: discord.Interaction) -> bool:
-        """Ensure the user is in the same voice channel."""
+        """Ensure the user is in the same voice channel as the bot."""
         vc = self._voice_client(interaction)
         if not vc:
             await interaction.response.send_message(
@@ -47,9 +55,19 @@ class MusicControlView(discord.ui.View):
                 ephemeral=True,
             )
             return False
-        if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
+        # Guard: user must be in *any* voice channel first
+        if not interaction.user.voice:
             await interaction.response.send_message(
-                embed=error_embed("Wrong Channel", "Join my voice channel first."),
+                embed=error_embed("Not in Voice", "You need to join a voice channel first."),
+                ephemeral=True,
+            )
+            return False
+        if interaction.user.voice.channel != vc.channel:
+            await interaction.response.send_message(
+                embed=error_embed(
+                    "Wrong Channel",
+                    f"Join **{vc.channel.name}** to use these controls.",
+                ),
                 ephemeral=True,
             )
             return False
@@ -57,7 +75,12 @@ class MusicControlView(discord.ui.View):
 
     # ── Buttons ───────────────────────────────────────────────────────────────
 
-    @discord.ui.button(label="⏸", style=discord.ButtonStyle.secondary, custom_id="mb_pause")
+    @discord.ui.button(
+        label="⏸ Pause",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mb_pause",
+        row=0,
+    )
     async def pause_resume(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -66,32 +89,47 @@ class MusicControlView(discord.ui.View):
         vc = self._voice_client(interaction)
         if vc.is_paused():
             vc.resume()
-            button.label = "⏸"
+            button.label = "⏸ Pause"
+            button.style = discord.ButtonStyle.secondary
             await interaction.response.edit_message(view=self)
         elif vc.is_playing():
             vc.pause()
-            button.label = "▶"
+            button.label = "▶ Resume"
+            button.style = discord.ButtonStyle.success  # green = "press to resume"
             await interaction.response.edit_message(view=self)
         else:
             await interaction.response.defer()
 
-    @discord.ui.button(label="⏭", style=discord.ButtonStyle.primary, custom_id="mb_skip")
+    @discord.ui.button(
+        label="⏭ Skip",
+        style=discord.ButtonStyle.primary,
+        custom_id="mb_skip",
+        row=0,
+    )
     async def skip(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if not await self._check(interaction):
             return
         vc = self._voice_client(interaction)
-        # Cancel progress task immediately so it doesn't edit stale message (Bug #4)
         player = self.bot.get_player(self.guild_id)
+        # Cancel progress task immediately so it doesn't edit a stale message
         if player.progress_task and not player.progress_task.done():
             player.progress_task.cancel()
             player.progress_task = None
-        if vc and vc.is_playing():
+        if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
-        await interaction.response.send_message("⏭ Skipped.", ephemeral=True, delete_after=3)
+        await interaction.response.send_message(
+            embed=success_embed("Skipped", "⏭ Skipped to the next track."),
+            ephemeral=True,
+        )
 
-    @discord.ui.button(label="🔁", style=discord.ButtonStyle.secondary, custom_id="mb_loop")
+    @discord.ui.button(
+        label="🔁 Loop",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mb_loop",
+        row=0,
+    )
     async def loop(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -99,14 +137,21 @@ class MusicControlView(discord.ui.View):
             return
         player = self.bot.get_player(self.guild_id)
         player.loop_mode = player.loop_mode.next()
-        button.label = {
-            "off":   "🔁",
-            "track": "🔂",
-            "queue": "🔁Q",
-        }.get(player.loop_mode.value, "🔁")
+        # Use the model's own label — no fragile manual dict here
+        button.label = player.loop_mode.label()
+        button.style = (
+            discord.ButtonStyle.success
+            if player.loop_mode.value != "off"
+            else discord.ButtonStyle.secondary
+        )
         await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="🔀", style=discord.ButtonStyle.secondary, custom_id="mb_shuffle")
+    @discord.ui.button(
+        label="🔀 Shuffle",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mb_shuffle",
+        row=0,
+    )
     async def shuffle(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -114,21 +159,36 @@ class MusicControlView(discord.ui.View):
             return
         player = self.bot.get_player(self.guild_id)
         player.shuffle()
-        await interaction.response.send_message("🔀 Queue shuffled.", ephemeral=True, delete_after=3)
+        await interaction.response.send_message(
+            embed=success_embed("Shuffled", "🔀 Queue has been shuffled."),
+            ephemeral=True,
+        )
 
-    @discord.ui.button(label="⏹", style=discord.ButtonStyle.danger, custom_id="mb_stop")
+    @discord.ui.button(
+        label="⏹ Stop",
+        style=discord.ButtonStyle.danger,
+        custom_id="mb_stop",
+        row=0,
+    )
     async def stop(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if not await self._check(interaction):
             return
         player = self.bot.get_player(self.guild_id)
+        # Cancel progress task before reset
+        if player.progress_task and not player.progress_task.done():
+            player.progress_task.cancel()
+            player.progress_task = None
         player.reset()
         vc = self._voice_client(interaction)
         if vc:
             vc.stop()
             await vc.disconnect()
-        await interaction.response.send_message("⏹ Stopped and disconnected.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=success_embed("Stopped", "⏹ Playback stopped and disconnected."),
+            ephemeral=True,
+        )
         self.stop()
 
 
@@ -143,7 +203,7 @@ class SearchSelectView(discord.ui.View):
     def __init__(
         self,
         tracks: list,
-        callback,
+        callback: Callable[[int], Awaitable[None]],
         *,
         timeout: float = 30.0,
     ) -> None:
@@ -171,7 +231,17 @@ class SearchSelectView(discord.ui.View):
         index = int(interaction.data["values"][0])
         await interaction.response.defer()
         self.stop()
-        await self._callback(index)
+        try:
+            await self._callback(index)
+        except Exception as exc:
+            logger.warning("SearchSelectView callback error: %s", exc)
+            try:
+                await interaction.followup.send(
+                    embed=error_embed("Selection Error", "Something went wrong. Please try again."),
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
 
     async def on_timeout(self) -> None:
         self.stop()
@@ -183,7 +253,8 @@ class QueueView(discord.ui.View):
     """
     Paginated queue display with ◀ / ▶ navigation buttons.
 
-    Improvements (V2):
+    Changes (V2.1):
+    - _build_embed() renamed to build_embed() — public API
     - Buttons are disabled when on first / last page
     - Refresh button to re-read the live queue
     - Page indicator in button labels
@@ -206,7 +277,8 @@ class QueueView(discord.ui.View):
         self.page       = 1
         self._update_buttons()
 
-    def _build_embed(self) -> discord.Embed:
+    def build_embed(self) -> discord.Embed:
+        """Build and return the queue embed for the current page (public)."""
         player = self.bot.get_player(self.guild_id)
         tracks = player.as_list()
         return queue_embed(
@@ -217,6 +289,9 @@ class QueueView(discord.ui.View):
             per_page       = self.PER_PAGE,
             total_duration = player.queue_duration(),
         )
+
+    # Keep the private alias for any internal legacy calls
+    _build_embed = build_embed
 
     def _max_pages(self) -> int:
         player = self.bot.get_player(self.guild_id)
@@ -230,21 +305,21 @@ class QueueView(discord.ui.View):
             if hasattr(child, "custom_id"):
                 if child.custom_id == "queue_prev":
                     child.disabled = self.page <= 1
-                    child.label    = "◀"
+                    child.label    = "◀ Prev"
                 elif child.custom_id == "queue_next":
                     child.disabled = self.page >= max_pages
-                    child.label    = "▶"
+                    child.label    = "Next ▶"
                 elif child.custom_id == "queue_page_indicator":
                     child.label    = f"📄 {self.page}/{max_pages}"
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="queue_prev")
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="queue_prev")
     async def prev_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if self.page > 1:
             self.page -= 1
         self._update_buttons()
-        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="📄 1/1", style=discord.ButtonStyle.secondary, custom_id="queue_page_indicator", disabled=True)
     async def page_indicator(
@@ -252,14 +327,14 @@ class QueueView(discord.ui.View):
     ) -> None:
         await interaction.response.defer()
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="queue_next")
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="queue_next")
     async def next_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if self.page < self._max_pages():
             self.page += 1
         self._update_buttons()
-        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.primary, custom_id="queue_refresh")
     async def refresh(
@@ -267,5 +342,4 @@ class QueueView(discord.ui.View):
     ) -> None:
         """Re-read the live queue and update the embed."""
         self._update_buttons()
-        await interaction.response.edit_message(embed=self._build_embed(), view=self)
-
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)

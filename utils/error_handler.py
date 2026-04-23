@@ -2,10 +2,14 @@
 """
 utils/error_handler.py — Centralized error classification and user-friendly messages.
 
+All user-facing strings are bilingual: English (primary) with Thai subtitle,
+so the bot is accessible to both Thai-speaking communities and global users.
+
 Provides:
 - classify_ytdl_error()  — Detect copyright / unavailable / network / age-restricted
-- playback_error_embed() — Beautiful red embed for playback failures
-- handle_playback_error() — Send error notification to text channel
+- playback_error_embed() — Rich red embed for playback failures
+- notify_playback_error() — Send error notification to text channel
+- command_error_embed() — Slash-command error embed
 """
 
 from __future__ import annotations
@@ -38,50 +42,58 @@ def classify_ytdl_error(exc: Exception) -> tuple[str, str, str]:
     Classify a yt-dlp / playback exception.
 
     Returns a tuple of (error_type, title, description) — all user-facing strings.
+    Strings are bilingual: English primary, Thai secondary on a new line.
     """
     msg = str(exc).lower()
 
     if any(k in msg for k in ("copyright", "removed", "blocked", "content warning")):
         return (
             YTDLErrorType.COPYRIGHT,
-            "🚫 ติดลิขสิทธิ์ / Blocked",
-            "เพลงนี้ถูกบล็อคหรือติดลิขสิทธิ์ในภูมิภาคนี้ ข้ามไปเพลงถัดไปให้นะครับ",
+            "🚫 Blocked — Copyright / Region Restricted",
+            "This track is blocked or copyright-restricted in this region.\n"
+            "*(เพลงนี้ถูกบล็อคหรือติดลิขสิทธิ์ในภูมิภาคนี้)*",
         )
     if any(k in msg for k in ("private video", "private", "members-only")):
         return (
             YTDLErrorType.PRIVATE,
-            "🔒 วิดีโอไม่สาธารณะ",
-            "วิดีโอนี้เป็น Private หรือเฉพาะสมาชิก ข้ามไปเพลงถัดไปให้นะครับ",
+            "🔒 Private / Members-Only Video",
+            "This video is private or restricted to channel members.\n"
+            "*(วิดีโอนี้เป็น Private หรือเฉพาะสมาชิก)*",
         )
     if any(k in msg for k in ("age", "sign in", "confirm your age")):
         return (
             YTDLErrorType.AGE_RESTRICT,
-            "🔞 จำกัดอายุ",
-            "วิดีโอนี้มีการจำกัดอายุ ไม่สามารถเล่นได้ ข้ามไปเพลงถัดไปให้นะครับ",
+            "🔞 Age-Restricted Content",
+            "This video requires age verification and cannot be played.\n"
+            "*(วิดีโอนี้มีการจำกัดอายุ ไม่สามารถเล่นได้)*",
         )
     if any(k in msg for k in ("not available", "unavailable", "deleted", "does not exist")):
         return (
             YTDLErrorType.UNAVAILABLE,
-            "❌ วิดีโอไม่พร้อมใช้งาน",
-            "วิดีโอนี้ถูกลบหรือไม่พร้อมใช้งาน ข้ามไปเพลงถัดไปให้นะครับ",
+            "❌ Video Unavailable",
+            "This video has been deleted or is no longer available.\n"
+            "*(วิดีโอนี้ถูกลบหรือไม่พร้อมใช้งาน)*",
         )
     if any(k in msg for k in ("429", "rate limit", "too many requests")):
         return (
             YTDLErrorType.RATE_LIMIT,
-            "⏳ YouTube Rate Limit",
-            "ดึงข้อมูลจาก YouTube ถี่เกินไป กรุณารอสักครู่แล้วลองใหม่นะครับ",
+            "⏳ YouTube Rate Limited",
+            "Too many requests to YouTube. Please wait a moment and try again.\n"
+            "*(ดึงข้อมูลจาก YouTube ถี่เกินไป กรุณารอสักครู่)*",
         )
     if any(k in msg for k in ("timeout", "connection", "network", "ssl", "errno")):
         return (
             YTDLErrorType.NETWORK,
-            "🌐 ปัญหาเครือข่าย",
-            "เชื่อมต่อไม่ได้ในขณะนี้ บอทจะข้ามไปเพลงถัดไปให้นะครับ",
+            "🌐 Network Error",
+            "Could not connect to the audio source. The bot will skip to the next track.\n"
+            "*(เชื่อมต่อไม่ได้ในขณะนี้ บอทจะข้ามไปเพลงถัดไป)*",
         )
 
     return (
         YTDLErrorType.UNKNOWN,
-        "⚠️ เกิดข้อผิดพลาด",
-        "เล่นเพลงนี้ไม่ได้ บอทจะข้ามไปเพลงถัดไปให้นะครับ",
+        "⚠️ Playback Error",
+        "An unexpected error occurred. The bot will skip to the next track.\n"
+        "*(เกิดข้อผิดพลาดที่ไม่คาดคิด บอทจะข้ามไปเพลงถัดไป)*",
     )
 
 
@@ -94,7 +106,7 @@ def playback_error_embed(
     skipping: bool = True,
 ) -> discord.Embed:
     """
-    Build a beautiful red embed describing a playback failure.
+    Build a red embed describing a playback failure.
     If `skipping` is True, appends a note that the bot is auto-skipping.
     """
     error_type, title, description = classify_ytdl_error(exc)
@@ -107,15 +119,21 @@ def playback_error_embed(
 
     if track:
         e.add_field(
-            name   = "🎵 เพลงที่มีปัญหา",
-            value  = f"**{track.title[:80]}**",
+            name   = "🎵 Track",
+            value  = f"**{track.title[:80]}**\n[Open link]({track.url})",
             inline = False,
         )
 
     if skipping:
         e.add_field(
-            name   = "⏭ สถานะ",
-            value  = "กำลังข้ามไปเพลงถัดไปอัตโนมัติ...",
+            name   = "⏭ Action",
+            value  = "Auto-skipping to the next track… *(กำลังข้ามไปเพลงถัดไปอัตโนมัติ)*",
+            inline = False,
+        )
+    else:
+        e.add_field(
+            name   = "⏹ Action",
+            value  = "Playback stopped — queue limit reached. *(หยุดการเล่นแล้ว)*",
             inline = False,
         )
 
@@ -132,12 +150,15 @@ def command_error_embed(error: Exception) -> discord.Embed:
         msg = msg[:197] + "..."
 
     e = discord.Embed(
-        title       = "⚠️ เกิดข้อผิดพลาด",
-        description = "คำสั่งนี้ทำงานไม่สำเร็จ กรุณาลองใหม่อีกครั้งครับ",
+        title       = "⚠️ Command Failed",
+        description = (
+            "Something went wrong while running that command. Please try again.\n"
+            "*(คำสั่งนี้ทำงานไม่สำเร็จ กรุณาลองใหม่อีกครั้ง)*"
+        ),
         colour      = 0xED4245,
     )
-    e.add_field(name="รายละเอียด", value=f"```{msg}```", inline=False)
-    e.set_footer(text="ถ้าปัญหายังคงอยู่ โปรดแจ้งผู้ดูแลระบบ")
+    e.add_field(name="Details", value=f"```{msg}```", inline=False)
+    e.set_footer(text="If this keeps happening, please contact a server administrator.")
     return e
 
 
