@@ -48,6 +48,14 @@ YTDL_TIMEOUT: float      = 25.0
 YTDL_STREAM_TIMEOUT: float = 15.0  # faster timeout for stream URL resolution
 YTDL_AUDIO_FORMAT: str   = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
 
+# ── Search result cache ───────────────────────────────────────────────────────
+SEARCH_CACHE_TTL: int      = 300   # seconds (5 min)
+SEARCH_CACHE_MAX_SIZE: int = 100   # max distinct search queries cached
+
+# ── Voice reconnect ───────────────────────────────────────────────────────────
+RECONNECT_ATTEMPTS: int  = 3      # max reconnect attempts on unexpected disconnect
+RECONNECT_BASE_DELAY: float = 2.0  # seconds (doubled each attempt)
+
 # ── Error handling ────────────────────────────────────────────────────────────
 SKIP_ERROR_LIMIT: int    = 5    # max consecutive broken tracks before stopping
 
