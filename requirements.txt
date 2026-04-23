@@ -1,0 +1,25 @@
+# Music Bot V2 — Python Dependencies
+# Tested with Python 3.10+
+
+# ── Core Discord (with voice) ──────────────────────────────────────────────────
+discord.py[voice]>=2.3.2
+aiohttp>=3.9.1
+
+# ── Audio extraction ───────────────────────────────────────────────────────────
+yt-dlp>=2024.1.1
+PyNaCl>=1.5.0
+
+# ── Database ───────────────────────────────────────────────────────────────────
+aiosqlite>=0.19.0
+
+# ── Config ────────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── System monitoring ─────────────────────────────────────────────────────────
+psutil>=5.9.0
+
+# ── Optional: Spotify integration ─────────────────────────────────────────────
+# spotipy>=2.23.0
+
+# ── Optional: Keep-alive webserver (for Render / Railway / UptimeRobot) ────────
+# flask>=3.0.0
