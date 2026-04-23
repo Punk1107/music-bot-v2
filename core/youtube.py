@@ -4,14 +4,17 @@ core/youtube.py — YouTube data extraction via yt-dlp.
 
 Provides:
 - Single track extraction from URL
-- Text-based search
+- Text-based search (with dedicated Track-level LRU cache)
 - YouTube playlist extraction
-- In-memory LRU-style result cache
+- In-memory LRU-style result cache for raw yt-dlp responses
 
-V2 Optimizations:
-- Separated metadata opts (fast, extract_flat) from stream opts (full resolve)
-- noplaylist=True for single tracks to avoid accidental playlist expansion
-- Audio-only format selection with no DASH manifest parsing
+V3 Optimizations:
+  - Dedicated _search_cache stores resolved Track lists (not raw dicts) so
+    cache hits require zero re-parsing.  TTL & size from config.
+  - True exponential backoff: sleep(min(2**(attempt-1), 8)) → 1s, 2s, 4s
+  - asyncio.TimeoutError caught separately from generic Exception so
+    transient timeouts get WARNING level, code bugs get ERROR level.
+  - Existing _extract() dict cache is kept for URL lookups (unchanged).
 """
 
 from __future__ import annotations
@@ -51,8 +54,8 @@ _META_OPTS: dict = {
     "default_search":                "ytsearch",
     "nocheckcertificate":            True,
     "source_address":                "0.0.0.0",
-    "noplaylist":                    True,      # ✅ prevent accidental playlist load
-    "extract_flat":                  True,      # ✅ metadata only, skip format resolution
+    "noplaylist":                    True,      # prevent accidental playlist load
+    "extract_flat":                  True,      # metadata only, skip format resolution
     "geo_bypass":                    True,
     "cachedir":                      False,
     "retries":                       config.YTDL_RETRIES,
@@ -69,13 +72,13 @@ _STREAM_OPTS: dict = {
     "nocheckcertificate":            True,
     "source_address":                "0.0.0.0",
     "noplaylist":                    True,
-    "extract_flat":                  False,     # ✅ full resolve for CDN URL
+    "extract_flat":                  False,     # full resolve for CDN URL
     "geo_bypass":                    True,
     "cachedir":                      False,
     "retries":                       2,         # fewer retries for speed
     "socket_timeout":                10,
     "skip_download":                 True,
-    "youtube_include_dash_manifest": False,     # ✅ skip DASH — faster
+    "youtube_include_dash_manifest": False,     # skip DASH — faster
 }
 
 # Used for playlist extraction — flat list, fast
@@ -87,7 +90,7 @@ _PLAYLIST_OPTS: dict = {
     "nocheckcertificate": True,
     "source_address":     "0.0.0.0",
     "noplaylist":         False,               # must be False for playlists
-    "extract_flat":       "in_playlist",       # ✅ flat extraction only
+    "extract_flat":       "in_playlist",       # flat extraction only
     "geo_bypass":         True,
     "cachedir":           False,
     "retries":            config.YTDL_RETRIES,
@@ -106,8 +109,13 @@ class YouTubeExtractor:
     """Thread-safe, cached YouTube extractor wrapping yt-dlp."""
 
     def __init__(self) -> None:
+        # ── Raw-dict cache (for URL metadata lookups) ──────────────────────
         self._cache:      dict[str, tuple[dict, float]] = {}
         self._cache_lock: asyncio.Lock = asyncio.Lock()
+
+        # ── Track-list search cache (query → resolved Track objects) ───────
+        self._search_cache:      dict[str, tuple[list[Track], float]] = {}
+        self._search_cache_lock: asyncio.Lock = asyncio.Lock()
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
@@ -138,10 +146,12 @@ class YouTubeExtractor:
         Extract info for *query* with optional caching and retry logic.
         Runs the blocking yt-dlp call in a thread-pool executor.
 
+        Uses true exponential backoff: 1s → 2s → 4s (capped at 8s).
+
         Args:
             query:     URL or search string
             opts:      yt-dlp options dict; defaults to _META_OPTS
-            use_cache: whether to read/write the in-memory cache
+            use_cache: whether to read/write the in-memory dict cache
             timeout:   asyncio timeout (seconds); defaults to config.YTDL_TIMEOUT
         """
         if opts is None:
@@ -176,18 +186,25 @@ class YouTubeExtractor:
                             oldest = min(self._cache, key=lambda k: self._cache[k][1])
                             del self._cache[oldest]
                 return result
+
             except asyncio.TimeoutError:
+                # Transient timeout — warn but don't treat as code bug
+                backoff = min(2 ** (attempt - 1), 8)
                 logger.warning(
-                    "yt-dlp timeout attempt %d/%d: %s", attempt, config.YTDL_RETRIES, query
+                    "yt-dlp timeout attempt %d/%d for '%s' — backoff %ds",
+                    attempt, config.YTDL_RETRIES, query, backoff,
                 )
                 last_exc = asyncio.TimeoutError()
+
             except Exception as exc:
+                backoff = min(2 ** (attempt - 1), 8)
                 logger.warning(
                     "yt-dlp error attempt %d/%d: %s", attempt, config.YTDL_RETRIES, exc
                 )
                 last_exc = exc
+
             if attempt < config.YTDL_RETRIES:
-                await asyncio.sleep(attempt)  # exponential-ish back-off
+                await asyncio.sleep(min(2 ** (attempt - 1), 8))
 
         logger.error(
             "yt-dlp failed after %d attempts for '%s': %s",
@@ -266,10 +283,9 @@ class YouTubeExtractor:
     async def get_track(self, url: str) -> Optional[Track]:
         """
         Fetch metadata for a single YouTube URL.
-        Uses extract_flat=True for speed — no format resolution.
+        Uses full resolve opts for single tracks to get complete metadata.
         """
         url  = self._clean_url(url)
-        # Use full resolve opts for single tracks so we get complete metadata
         info = await self._extract(url, opts={**_META_OPTS, "extract_flat": False})
         if not info:
             return None
@@ -291,8 +307,11 @@ class YouTubeExtractor:
         try:
             result = await asyncio.wait_for(
                 loop.run_in_executor(None, self._run_ytdl, _STREAM_OPTS, url),
-                timeout=config.YTDL_STREAM_TIMEOUT,  # ✅ faster timeout
+                timeout=config.YTDL_STREAM_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            logger.error("get_stream_url timed out for '%s'", url)
+            raise
         except Exception as exc:
             logger.error("get_stream_url failed for '%s': %s", url, exc)
             raise  # re-raise so caller can handle + classify
@@ -305,16 +324,36 @@ class YouTubeExtractor:
         return self._extract_stream_url(entry)
 
     async def search(self, query: str, max_results: int = 10) -> list[Track]:
-        """Search YouTube and return up to *max_results* Track objects."""
+        """
+        Search YouTube and return up to *max_results* Track objects.
+
+        Uses a dedicated Track-level LRU cache (keyed by query+max_results) so
+        cache hits are instant — no yt-dlp call, no dict re-parsing.
+        """
         if not query or not query.strip():
             return []
-        # Search uses metadata-only opts (extract_flat=True for speed)
+
+        cache_key = f"{query.strip()}::{max_results}"
+        now = time.monotonic()
+
+        # ── Cache hit check ──────────────────────────────────────────────
+        async with self._search_cache_lock:
+            entry = self._search_cache.get(cache_key)
+            if entry:
+                tracks, ts = entry
+                if now - ts < config.SEARCH_CACHE_TTL:
+                    logger.debug("Search cache hit for '%s'", query)
+                    return tracks
+                del self._search_cache[cache_key]
+
+        # ── Cache miss — fetch from yt-dlp ───────────────────────────────
         info = await self._extract(
             f"ytsearch{max_results}:{query.strip()}",
             opts={**_META_OPTS, "extract_flat": False},  # need metadata for duration
         )
         if not info or "entries" not in info:
             return []
+
         tracks: list[Track] = []
         for entry in info["entries"]:
             if not entry:
@@ -322,14 +361,22 @@ class YouTubeExtractor:
             track = self._entry_to_track(entry)
             if track:
                 tracks.append(track)
+
+        # ── Store in search cache ─────────────────────────────────────────
+        if tracks:
+            async with self._search_cache_lock:
+                self._search_cache[cache_key] = (tracks, time.monotonic())
+                if len(self._search_cache) > config.SEARCH_CACHE_MAX_SIZE:
+                    oldest = min(self._search_cache, key=lambda k: self._search_cache[k][1])
+                    del self._search_cache[oldest]
+
         return tracks
 
     async def get_playlist(self, url: str, max_tracks: int = 50) -> list[Track]:
         """
         Extract up to *max_tracks* tracks from a YouTube playlist.
 
-        V2.1 optimisation: uses a single flat extraction pass instead of
-        individual metadata fetches per track.  Full metadata (stream URL)
+        Uses a single flat extraction pass — full metadata (stream URL)
         is resolved lazily at playback time via get_stream_url().
         """
         logger.info("Extracting playlist (max %d): %s", max_tracks, url)

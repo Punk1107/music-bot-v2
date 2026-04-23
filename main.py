@@ -14,6 +14,7 @@ import signal
 from collections import defaultdict
 from typing import Optional
 
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 
@@ -80,6 +81,10 @@ class MusicBot(commands.Bot):
         self.spotify         = SpotifyExtractor()
         self.audio_processor = AudioEffectsProcessor()
 
+        # ── Shared HTTP session (for thumbnail color extraction, etc.) ─────────
+        # Initialised in setup_hook() once the event loop is running.
+        self.http_session: Optional[aiohttp.ClientSession] = None
+
         # ── Per-guild player registry ─────────────────────────────────────────
         self._players: dict[int, GuildPlayer] = {}
 
@@ -112,6 +117,14 @@ class MusicBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Called once by discord.py before connecting to the gateway."""
+        # Create the shared HTTP session here — event loop is running
+        self.http_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300),
+            timeout=aiohttp.ClientTimeout(total=10.0),
+            headers={"User-Agent": "MusicBot/2.0 (Discord)"},
+        )
+        logger.info("Shared aiohttp.ClientSession created.")
+
         await self.db.initialise()
 
         for ext in _COGS:
@@ -167,6 +180,11 @@ class MusicBot(commands.Bot):
                     )
             except Exception as exc:
                 logger.warning("Failed to persist queue for guild %d: %s", guild_id, exc)
+
+        # Close shared HTTP session
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+            logger.info("Shared aiohttp.ClientSession closed.")
 
         # Close the persistent DB connection cleanly
         try:

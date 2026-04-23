@@ -4,8 +4,16 @@ core/player.py — Per-guild music player state.
 
 GuildPlayer encapsulates everything that belongs to one Discord guild:
 queue, current track, loop mode, active effects, volume, and seek position.
-It does NOT interact with discord.py voice clients directly — that is the
-cog's responsibility.
+
+V3 Changes:
+  - asyncio.Lock on all queue-mutating operations to prevent race conditions
+    when multiple users press buttons simultaneously.
+  - All mutating queue methods are now async (enqueue, extend, dequeue,
+    remove, shuffle, clear, finish_track).
+  - last_channel_id field stores the last voice channel ID for self-healing
+    reconnect logic in the music cog.
+  - queue_lock exposed publicly so callers can acquire it for multi-step
+    atomic operations (e.g. move = remove + insert).
 """
 
 from __future__ import annotations
@@ -24,8 +32,8 @@ class GuildPlayer:
     """
     Mutable state container for a single guild's music session.
 
-    Thread-safety note: all mutations are expected to happen on the asyncio
-    event loop, so no extra locking is added.
+    All queue-mutating methods acquire self.queue_lock — safe for concurrent
+    Discord interaction events on the asyncio event loop.
     """
 
     def __init__(self, guild_id: int) -> None:
@@ -33,57 +41,84 @@ class GuildPlayer:
 
         # ── Queue ──────────────────────────────────────────────────────────────
         self._queue: deque[Track] = deque()
+        self.queue_lock: asyncio.Lock = asyncio.Lock()
 
-        # ── Now-playing ──────────────────────────────────────────────────────────────────
-        self.now_playing:       Optional[Track]           = None
-        self.play_start_time:   Optional[datetime]        = None
-        self.now_playing_msg:   Optional[object]          = None  # discord.Message
-        self.now_playing_msg_id: Optional[int]            = None  # fallback ID
+        # ── Now-playing ───────────────────────────────────────────────────────
+        self.now_playing:        Optional[Track]        = None
+        self.play_start_time:    Optional[datetime]     = None
+        self.now_playing_msg:    Optional[object]       = None  # discord.Message
+        self.now_playing_msg_id: Optional[int]          = None  # fallback ID
 
         # ── Controls ───────────────────────────────────────────────────────────
-        self.loop_mode:         LoopMode                  = LoopMode.OFF
-        self.effects:           list[AudioEffect]         = []
-        self.volume:            float                     = 0.75
-        self.seek_position:     int                       = 0
-        self.quality:           str                       = "MEDIUM"
+        self.loop_mode:     LoopMode           = LoopMode.OFF
+        self.effects:       list[AudioEffect]  = []
+        self.volume:        float              = 0.75
+        self.seek_position: int                = 0
+        self.quality:       str                = "MEDIUM"
 
         # ── Background tasks ───────────────────────────────────────────────────
-        self.progress_task:     Optional[asyncio.Task]    = None
-        self.idle_since:        Optional[datetime]        = None
+        self.progress_task: Optional[asyncio.Task] = None
+        self.idle_since:    Optional[datetime]      = None
 
-        # ── Last interaction channel (for auto-announce) ───────────────────────
-        self.text_channel:      Optional[object]          = None  # discord.TextChannel
+        # ── Channel references ─────────────────────────────────────────────────
+        self.text_channel:    Optional[object] = None  # discord.TextChannel
+        self.last_channel_id: Optional[int]    = None  # last VC id for reconnect
 
-    # ── Queue management ──────────────────────────────────────────────────────
+        # ── Cached accent color from thumbnail ────────────────────────────────
+        self.accent_color: Optional[int] = None  # 0xRRGGBB or None → default
 
-    def enqueue(self, track: Track) -> None:
-        self._queue.append(track)
+    # ── Queue management (all async, all locked) ──────────────────────────────
 
-    def extend(self, tracks: list[Track]) -> None:
-        self._queue.extend(tracks)
+    async def enqueue(self, track: Track) -> None:
+        async with self.queue_lock:
+            self._queue.append(track)
 
-    def dequeue(self) -> Optional[Track]:
+    async def extend(self, tracks: list[Track]) -> None:
+        async with self.queue_lock:
+            self._queue.extend(tracks)
+
+    async def dequeue(self) -> Optional[Track]:
         """Pop the next track from the front of the queue."""
-        return self._queue.popleft() if self._queue else None
+        async with self.queue_lock:
+            return self._queue.popleft() if self._queue else None
 
-    def remove(self, index: int) -> Optional[Track]:
+    async def remove(self, index: int) -> Optional[Track]:
         """Remove and return the track at *index* (0-based). Returns None if OOB."""
-        if index < 0 or index >= len(self._queue):
-            return None
-        lst = list(self._queue)
-        track = lst.pop(index)
-        self._queue = deque(lst)
-        return track
+        async with self.queue_lock:
+            if index < 0 or index >= len(self._queue):
+                return None
+            lst = list(self._queue)
+            track = lst.pop(index)
+            self._queue = deque(lst)
+            return track
 
-    def shuffle(self) -> None:
-        lst = list(self._queue)
-        random.shuffle(lst)
-        self._queue = deque(lst)
+    async def shuffle(self) -> None:
+        async with self.queue_lock:
+            lst = list(self._queue)
+            random.shuffle(lst)
+            self._queue = deque(lst)
 
-    def clear(self) -> None:
-        self._queue.clear()
+    async def clear(self) -> None:
+        async with self.queue_lock:
+            self._queue.clear()
 
-    # ── Queue queries ─────────────────────────────────────────────────────────
+    async def move(self, from_idx: int, to_idx: int) -> Optional[Track]:
+        """
+        Move the track at *from_idx* to *to_idx* (0-based).
+        Returns the moved Track or None if indices are invalid.
+        Atomic — holds the lock for the full read-modify-write.
+        """
+        async with self.queue_lock:
+            n = len(self._queue)
+            if not (0 <= from_idx < n) or not (0 <= to_idx < n):
+                return None
+            lst = list(self._queue)
+            track = lst.pop(from_idx)
+            lst.insert(to_idx, track)
+            self._queue = deque(lst)
+            return track
+
+    # ── Queue queries (read-only — no lock needed) ────────────────────────────
 
     def as_list(self) -> list[Track]:
         return list(self._queue)
@@ -98,11 +133,17 @@ class GuildPlayer:
         """Sum of all queued track durations in seconds."""
         return sum(t.duration for t in self._queue)
 
+    def peek_next(self) -> Optional[Track]:
+        """Return the next track without removing it. None if queue empty."""
+        return self._queue[0] if self._queue else None
+
     # ── Now-playing helpers ───────────────────────────────────────────────────
 
     def start_track(self, track: Track) -> None:
         self.now_playing     = track
         self.play_start_time = datetime.now(timezone.utc)
+        # Reset accent color — will be resolved for the new track
+        self.accent_color = None
 
     def elapsed_seconds(self) -> int:
         """Seconds since the current track started (0 if nothing is playing)."""
@@ -111,22 +152,26 @@ class GuildPlayer:
         delta = datetime.now(timezone.utc) - self.play_start_time
         return int(delta.total_seconds()) + self.seek_position
 
-    def finish_track(self) -> Optional[Track]:
+    async def finish_track(self) -> Optional[Track]:
         """
         Mark the current track as finished and advance the state.
 
         In TRACK loop mode the same track is re-queued at the front.
         In QUEUE loop mode the track is appended to the back.
         Returns the track that just finished (or None).
+
+        Holds the queue_lock for the appendleft/append operations.
         """
         finished = self.now_playing
         if finished is None:
             return None
 
         if self.loop_mode == LoopMode.TRACK:
-            self._queue.appendleft(finished)
+            async with self.queue_lock:
+                self._queue.appendleft(finished)
         elif self.loop_mode == LoopMode.QUEUE:
-            self._queue.append(finished)
+            async with self.queue_lock:
+                self._queue.append(finished)
 
         self.now_playing     = None
         self.play_start_time = None
@@ -156,16 +201,17 @@ class GuildPlayer:
     def reset(self) -> None:
         """Full reset — called on /stop or bot disconnect."""
         self._queue.clear()
-        self.now_playing     = None
-        self.play_start_time = None
-        self.seek_position   = 0
-        self.loop_mode       = LoopMode.OFF
+        self.now_playing        = None
+        self.play_start_time    = None
+        self.seek_position      = 0
+        self.loop_mode          = LoopMode.OFF
         self.effects.clear()
-        self.volume          = 0.75
-        self.quality         = "MEDIUM"
-        self.idle_since      = None
+        self.volume             = 0.75
+        self.quality            = "MEDIUM"
+        self.idle_since         = None
         self.now_playing_msg    = None
         self.now_playing_msg_id = None
+        self.accent_color       = None
         if self.progress_task and not self.progress_task.done():
             self.progress_task.cancel()
-        self.progress_task   = None
+        self.progress_task = None

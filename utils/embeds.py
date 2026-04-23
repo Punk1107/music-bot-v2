@@ -3,12 +3,11 @@
 utils/embeds.py — Discord embed factories.
 
 All embed colours come from config so they stay consistent across the bot.
-Changes in V2.1 refactor:
-  - now_playing_embed uses COLOR_NOW_PLAYING (purple) for visual distinction
-  - search/info embeds use COLOR_INFO (cyan)
-  - Footer no longer hardcodes "Recently added"
-  - loop field uses LoopMode.short_label() instead of brittle .replace() hack
-  - track_added_embed accepts is_first=True to show "▶ Now Playing" title
+
+V3 Changes:
+  - now_playing_embed() accepts accent_color kwarg for dynamic thumbnail color
+  - Falls back gracefully to config.COLOR_NOW_PLAYING when accent_color is None
+  - All other embeds unchanged
 """
 
 from __future__ import annotations
@@ -64,13 +63,17 @@ def now_playing_embed(
     queue_count:  int = 0,
     queue_dur:    int = 0,
     channel_name: str = "",
+    accent_color: Optional[int] = None,   # ← dynamic thumbnail color
 ) -> discord.Embed:
     bar = progress_bar(elapsed, track.duration)
+
+    # Use dynamic accent color if provided, otherwise fall back to config default
+    color = accent_color if accent_color is not None else config.COLOR_NOW_PLAYING
 
     e = discord.Embed(
         title       = "🎵 Now Playing",
         description = f"**[{truncate(track.title, 80)}]({track.url})**",
-        colour      = config.COLOR_NOW_PLAYING,
+        colour      = color,
     )
 
     if track.thumbnail:
@@ -106,7 +109,6 @@ def now_playing_embed(
         + (f" • {fmt_duration(queue_dur)}" if queue_dur else " • Live")
     )
     e.add_field(name="📋 Queue", value=queue_value, inline=True)
-    # Use short_loop directly — no emoji stripping needed
     e.add_field(name="🔁 Loop", value=loop_short, inline=True)
 
     # Row 3 — Settings (Volume + Quality) spanning full width

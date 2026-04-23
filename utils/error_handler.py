@@ -6,10 +6,11 @@ All user-facing strings are bilingual: English (primary) with Thai subtitle,
 so the bot is accessible to both Thai-speaking communities and global users.
 
 Provides:
-- classify_ytdl_error()  — Detect copyright / unavailable / network / age-restricted
-- playback_error_embed() — Rich red embed for playback failures
-- notify_playback_error() — Send error notification to text channel
-- command_error_embed() — Slash-command error embed
+- classify_ytdl_error()          — Detect copyright / unavailable / network / age-restricted
+- playback_error_embed()         — Rich red embed for playback failures
+- notify_playback_error()        — Send error notification to text channel
+- command_error_embed()          — Slash-command error embed
+- voice_connection_error_embed() — Voice reconnect failure embed [NEW]
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ class YTDLErrorType:
     PRIVATE      = "private"
     NETWORK      = "network"
     RATE_LIMIT   = "rate_limit"
+    TIMEOUT      = "timeout"
     UNKNOWN      = "unknown"
 
 
@@ -81,7 +83,15 @@ def classify_ytdl_error(exc: Exception) -> tuple[str, str, str]:
             "Too many requests to YouTube. Please wait a moment and try again.\n"
             "*(ดึงข้อมูลจาก YouTube ถี่เกินไป กรุณารอสักครู่)*",
         )
-    if any(k in msg for k in ("timeout", "connection", "network", "ssl", "errno")):
+    # Separate timeout classification from generic network errors
+    if "timeout" in msg or "timed out" in msg:
+        return (
+            YTDLErrorType.TIMEOUT,
+            "⏱ Request Timed Out",
+            "The audio source took too long to respond. The bot will skip to the next track.\n"
+            "*(แหล่งเสียงตอบสนองช้าเกินไป บอทจะข้ามไปเพลงถัดไป)*",
+        )
+    if any(k in msg for k in ("connection", "network", "ssl", "errno")):
         return (
             YTDLErrorType.NETWORK,
             "🌐 Network Error",
@@ -159,6 +169,27 @@ def command_error_embed(error: Exception) -> discord.Embed:
     )
     e.add_field(name="Details", value=f"```{msg}```", inline=False)
     e.set_footer(text="If this keeps happening, please contact a server administrator.")
+    return e
+
+
+def voice_connection_error_embed(
+    channel_name: str = "voice channel",
+    attempts: int = 3,
+) -> discord.Embed:
+    """
+    Build an embed for a failed voice reconnect attempt.
+    Sent to the text channel after all reconnect retries are exhausted.
+    """
+    e = discord.Embed(
+        title       = "📡 Voice Reconnect Failed",
+        description = (
+            f"Failed to reconnect to **{channel_name}** after **{attempts}** attempt(s).\n"
+            "Playback has been stopped. Please use `/play` to start a new session.\n\n"
+            "*(บอทไม่สามารถเชื่อมต่อกลับได้ กรุณาพิมพ์ /play เพื่อเริ่มใหม่)*"
+        ),
+        colour      = 0xFEE75C,   # Warning yellow
+    )
+    e.set_footer(text="Music Bot V2 • Self-Healing System")
     return e
 
 

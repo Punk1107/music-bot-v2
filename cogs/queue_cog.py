@@ -72,7 +72,7 @@ class QueueCog(commands.Cog, name="Queue"):
                 ephemeral=True,
             )
             return
-        player.shuffle()
+        await player.shuffle()
         await interaction.response.send_message(
             embed=success_embed("Shuffled", f"🔀 Shuffled **{len(player)}** tracks.")
         )
@@ -81,7 +81,7 @@ class QueueCog(commands.Cog, name="Queue"):
     async def clear(self, interaction: discord.Interaction) -> None:
         player = self.bot.get_player(interaction.guild_id)
         count  = len(player)
-        player.clear()
+        await player.clear()
         await self.bot.db.clear_queue(interaction.guild_id)
         await interaction.response.send_message(
             embed=success_embed(
@@ -102,7 +102,7 @@ class QueueCog(commands.Cog, name="Queue"):
     @app_commands.describe(position="Position in the queue (1-based)")
     async def remove(self, interaction: discord.Interaction, position: int) -> None:
         player = self.bot.get_player(interaction.guild_id)
-        track  = player.remove(position - 1)  # Convert to 0-based index
+        track  = await player.remove(position - 1)  # Convert to 0-based index
         if track is None:
             await interaction.response.send_message(
                 embed=error_embed(
@@ -131,8 +131,7 @@ class QueueCog(commands.Cog, name="Queue"):
         to_pos: int,
     ) -> None:
         player = self.bot.get_player(interaction.guild_id)
-        tracks = player.as_list()
-        n      = len(tracks)
+        n = len(player)
 
         if not (1 <= from_pos <= n) or not (1 <= to_pos <= n):
             await interaction.response.send_message(
@@ -144,12 +143,14 @@ class QueueCog(commands.Cog, name="Queue"):
             )
             return
 
-        track = tracks.pop(from_pos - 1)
-        tracks.insert(to_pos - 1, track)
-
-        # Rebuild the player queue from the reordered list
-        player.clear()
-        player.extend(tracks)
+        # Atomic move — holds queue_lock for the entire operation
+        track = await player.move(from_pos - 1, to_pos - 1)
+        if track is None:
+            await interaction.response.send_message(
+                embed=error_embed("Move Failed", "Could not move that track."),
+                ephemeral=True,
+            )
+            return
 
         await interaction.response.send_message(
             embed=success_embed(

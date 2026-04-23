@@ -2,27 +2,13 @@
 """
 cogs/music.py — Core music playback commands.
 
-Commands:
-  /join    — Join the caller's voice channel
-  /leave   — Leave and clear queue
-  /play    — Play from YouTube URL, Spotify URL, or search query (with autocomplete)
-  /search  — Interactive search with dropdown selection
-  /pause   — Pause playback
-  /resume  — Resume playback
-  /skip    — Skip the current track (ephemeral response)
-  /stop    — Stop playback, clear queue, stay connected
-
-V2.1 Changes:
-  - play/search defer with thinking=True for better UX on slow I/O
-  - _play_next guards against vc.is_playing() race condition
-  - record_track_played() replaces double DB call (add_history + increment_user_stats)
-  - after_play checks bot._shutdown before scheduling next track
-  - now_playing_embed passes loop_short from LoopMode.short_label()
-  - track_added_embed receives is_first=True when track plays immediately
-  - /skip success response is ephemeral to reduce channel noise
-  - Hardcoded Thai error text replaced with bilingual error_embed()
-  - Progress task uses config.PROGRESS_BAR_UPDATE_INTERVAL constant
-  - Fire-and-forget DB task has error callback to avoid silent failures
+V3 Changes:
+  - asyncio.gather with Semaphore(5) for parallel Spotify→YouTube resolution
+  - Self-healing _try_reconnect() on unexpected voice disconnect
+  - Dynamic embed accent color from thumbnail via color_thief.get_dominant_color()
+  - All player queue mutations use new async methods (enqueue, dequeue, etc.)
+  - track_added_embed uses delete_after=20s when queued (not first track)
+  - voice_connection_error_embed for reconnect failure notification
 """
 
 from __future__ import annotations
@@ -44,7 +30,8 @@ from utils.embeds import (
 )
 from utils.views import MusicControlView, SearchSelectView
 from utils.rate_limiter import RateLimiter
-from utils.error_handler import notify_playback_error
+from utils.error_handler import notify_playback_error, voice_connection_error_embed
+from utils.color_thief import get_dominant_color
 
 if TYPE_CHECKING:
     from main import MusicBot
@@ -85,6 +72,9 @@ class MusicCog(commands.Cog, name="Music"):
         channel = interaction.user.voice.channel
         try:
             vc = await channel.connect(timeout=10.0, reconnect=True)
+            # ✔ Store for self-healing reconnect
+            player = self.bot.get_player(interaction.guild_id)
+            player.last_channel_id = channel.id
             return vc
         except asyncio.TimeoutError:
             await interaction.followup.send(
@@ -98,6 +88,56 @@ class MusicCog(commands.Cog, name="Music"):
                 embed=error_embed("Connection Error", str(exc)), ephemeral=True
             )
             return None
+
+    async def _try_reconnect(
+        self, guild_id: int
+    ) -> Optional[discord.VoiceClient]:
+        """
+        Self-healing voice reconnect with exponential backoff.
+        Attempts up to config.RECONNECT_ATTEMPTS times.
+        Returns the new VoiceClient or None on total failure.
+        """
+        player = self.bot.get_player(guild_id)
+        guild  = self.bot.get_guild(guild_id)
+        if not guild or not player.last_channel_id:
+            return None
+
+        channel = guild.get_channel(player.last_channel_id)
+        if not channel or not isinstance(channel, discord.VoiceChannel):
+            return None
+
+        for attempt in range(1, config.RECONNECT_ATTEMPTS + 1):
+            delay = config.RECONNECT_BASE_DELAY * (2 ** (attempt - 1))  # 2s, 4s, 8s
+            logger.info(
+                "Voice reconnect attempt %d/%d for guild %d in %.0fs…",
+                attempt, config.RECONNECT_ATTEMPTS, guild_id, delay,
+            )
+            await asyncio.sleep(delay)
+            try:
+                vc = await channel.connect(timeout=10.0, reconnect=True)
+                logger.info(
+                    "✅ Voice reconnected for guild %d on attempt %d", guild_id, attempt
+                )
+                return vc
+            except Exception as exc:
+                logger.warning(
+                    "Reconnect attempt %d failed for guild %d: %s", attempt, guild_id, exc
+                )
+
+        # All attempts exhausted
+        logger.error("Voice reconnect failed for guild %d after %d attempts.",
+                     guild_id, config.RECONNECT_ATTEMPTS)
+        if player.text_channel:
+            try:
+                await player.text_channel.send(
+                    embed=voice_connection_error_embed(
+                        channel.name, config.RECONNECT_ATTEMPTS
+                    ),
+                    delete_after=30.0,
+                )
+            except Exception:
+                pass
+        return None
 
     def _rate_check(self, interaction: discord.Interaction) -> bool:
         return self.rate_limiter.is_rate_limited(
@@ -123,8 +163,11 @@ class MusicCog(commands.Cog, name="Music"):
 
         vc: Optional[discord.VoiceClient] = guild.voice_client
         if not vc or not vc.is_connected():
-            player.reset()
-            return
+            # ━━ Self-healing: attempt to reconnect before giving up ━━━━━━━━━━━━━━━━
+            vc = await self._try_reconnect(guild_id)
+            if not vc:
+                player.reset()
+                return
 
         # Race condition guard: don't start a second track if one is already playing
         if vc.is_playing():
@@ -134,9 +177,9 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         # Finish the previous track (handles loop logic inside GuildPlayer)
-        player.finish_track()
+        await player.finish_track()
 
-        next_track = player.dequeue()
+        next_track = await player.dequeue()
         if not next_track:
             player.idle_since = discord.utils.utcnow()
             return  # Queue exhausted
@@ -204,11 +247,23 @@ class MusicCog(commands.Cog, name="Music"):
                 await self._play_next(guild_id, skip_depth=skip_depth + 1)
             return
 
-        # ── Save to DB history (combined call — single connection/commit) ─────
-        try:
-            await self.bot.db.record_track_played(guild_id, next_track.requester_id, next_track)
-        except Exception as exc:
-            logger.warning("Failed to record track played for guild %d: %s", guild_id, exc)
+        # ── Save to DB + resolve accent color in parallel (asyncio.gather) ─────
+        async def _record_db():
+            try:
+                await self.bot.db.record_track_played(
+                    guild_id, next_track.requester_id, next_track
+                )
+            except Exception as exc:
+                logger.warning("Failed to record track played for guild %d: %s", guild_id, exc)
+
+        async def _resolve_color():
+            color = await get_dominant_color(
+                next_track.thumbnail,
+                session=getattr(self.bot, "http_session", None),
+            )
+            player.accent_color = color
+
+        await asyncio.gather(_record_db(), _resolve_color())
 
         # Cancel any previous progress-bar updater for this guild
         if player.progress_task and not player.progress_task.done():
@@ -243,6 +298,7 @@ class MusicCog(commands.Cog, name="Music"):
                         queue_count  = len(player),
                         queue_dur    = player.queue_duration(),
                         channel_name = next_track.uploader or "",
+                        accent_color = player.accent_color,
                     )
                     view = MusicControlView(self.bot, guild_id)
 
@@ -300,6 +356,7 @@ class MusicCog(commands.Cog, name="Music"):
                     queue_count  = len(player),
                     queue_dur    = player.queue_duration(),
                     channel_name = player.now_playing.uploader or "",
+                    accent_color = player.accent_color,  # reuse cached color
                 )
                 await player.now_playing_msg.edit(embed=embed)
 
@@ -443,18 +500,28 @@ class MusicCog(commands.Cog, name="Music"):
                 return
 
             added = 0
-            for sp_track in spotify_tracks:
-                if len(player) >= cfg.max_queue_size:
-                    break
-                yt_results = await self.bot.youtube.search(sp_track.search_query, max_results=1)
-                if not yt_results:
-                    continue
-                t = yt_results[0]
-                t.requester_id = interaction.user.id
-                if sp_track.image_url:
-                    t.thumbnail = sp_track.image_url
-                player.enqueue(t)
-                added += 1
+            sem = asyncio.Semaphore(5)  # max 5 parallel YouTube searches
+
+            async def _resolve_spotify_track(sp_track):
+                async with sem:
+                    if len(player) >= cfg.max_queue_size:
+                        return
+                    yt_results = await self.bot.youtube.search(
+                        sp_track.search_query, max_results=1
+                    )
+                    if not yt_results:
+                        return
+                    t = yt_results[0]
+                    t.requester_id = interaction.user.id
+                    if sp_track.image_url:
+                        t.thumbnail = sp_track.image_url
+                    await player.enqueue(t)
+                    nonlocal added
+                    added += 1
+
+            await asyncio.gather(
+                *[_resolve_spotify_track(sp) for sp in spotify_tracks]
+            )
 
             if not added:
                 await interaction.followup.send(
@@ -480,12 +547,14 @@ class MusicCog(commands.Cog, name="Music"):
                 )
                 return
             added = 0
+            to_add = []
             for t in tracks:
-                if len(player) >= cfg.max_queue_size:
+                if len(player) + len(to_add) >= cfg.max_queue_size:
                     break
                 t.requester_id = interaction.user.id
-                player.enqueue(t)
-                added += 1
+                to_add.append(t)
+            await player.extend(to_add)
+            added = len(to_add)
             await interaction.followup.send(
                 embed=success_embed(
                     "Playlist Added",
@@ -519,17 +588,20 @@ class MusicCog(commands.Cog, name="Music"):
                 )
                 return
             track.requester_id = interaction.user.id
-            player.enqueue(track)
+            await player.enqueue(track)
             pos = len(player)
             is_first = not vc.is_playing() and not vc.is_paused()
-            await interaction.followup.send(embed=track_added_embed(
-                track, pos,
-                requester    = interaction.user,
-                channel_name = track.uploader or "",
-                queue_count  = len(player),
-                queue_dur    = player.queue_duration(),
-                is_first     = is_first,
-            ))
+            await interaction.followup.send(
+                embed=track_added_embed(
+                    track, pos,
+                    requester    = interaction.user,
+                    channel_name = track.uploader or "",
+                    queue_count  = len(player),
+                    queue_dur    = player.queue_duration(),
+                    is_first     = is_first,
+                ),
+                delete_after=None if is_first else 20.0,
+            )
 
         # ── Search query ────────────────────────────────────────────────────────
         else:
@@ -549,17 +621,20 @@ class MusicCog(commands.Cog, name="Music"):
                     ephemeral=True,
                 )
                 return
-            player.enqueue(track)
+            await player.enqueue(track)
             pos = len(player)
             is_first = not vc.is_playing() and not vc.is_paused()
-            await interaction.followup.send(embed=track_added_embed(
-                track, pos,
-                requester    = interaction.user,
-                channel_name = track.uploader or "",
-                queue_count  = len(player),
-                queue_dur    = player.queue_duration(),
-                is_first     = is_first,
-            ))
+            await interaction.followup.send(
+                embed=track_added_embed(
+                    track, pos,
+                    requester    = interaction.user,
+                    channel_name = track.uploader or "",
+                    queue_count  = len(player),
+                    queue_dur    = player.queue_duration(),
+                    is_first     = is_first,
+                ),
+                delete_after=None if is_first else 20.0,
+            )
 
         # Save search query to history for autocomplete — fire-and-forget with error logging
         if not query.startswith("http"):
@@ -619,17 +694,20 @@ class MusicCog(commands.Cog, name="Music"):
                     ephemeral=True,
                 )
                 return
-            player.enqueue(track)
+            await player.enqueue(track)
             pos = len(player)
             is_first = not vc.is_playing() and not vc.is_paused()
-            await interaction.followup.send(embed=track_added_embed(
-                track, pos,
-                requester    = interaction.user,
-                channel_name = track.uploader or "",
-                queue_count  = len(player),
-                queue_dur    = player.queue_duration(),
-                is_first     = is_first,
-            ))
+            await interaction.followup.send(
+                embed=track_added_embed(
+                    track, pos,
+                    requester    = interaction.user,
+                    channel_name = track.uploader or "",
+                    queue_count  = len(player),
+                    queue_dur    = player.queue_duration(),
+                    is_first     = is_first,
+                ),
+                delete_after=None if is_first else 20.0,
+            )
             if is_first:
                 await self._play_next(interaction.guild_id)
 

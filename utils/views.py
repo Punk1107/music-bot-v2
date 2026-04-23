@@ -2,13 +2,16 @@
 """
 utils/views.py — Discord UI Views (Buttons, Selects) for the music bot.
 
-V2.1 Changes:
-  - MusicControlView._check() guards against user.voice being None (AttributeError fix)
-  - pause/resume button uses ButtonStyle.success (green) when paused for visual affordance
-  - skip/shuffle/stop buttons respond with proper embeds, not plain strings
-  - Loop button uses LoopMode.label() from the model — no fragile dict mapping
-  - SearchSelectView wraps callback in try/except to catch closure errors
-  - QueueView._build_embed() renamed to build_embed() (public API)
+V3 Changes:
+  - MusicControlView: dynamic button state management via _sync_buttons()
+    * ⏭ Skip button shows live queue count badge: "⏭ Skip (3)"
+    * ⏭ Skip disabled when nothing is playing
+    * 🔀 Shuffle disabled when queue has < 2 tracks
+    * 🔁 Loop button emoji & style reflects current LoopMode
+  - Two new volume buttons 🔉 / 🔊 (row 1) for ±10% quick nudge
+  - update_view() helper refreshes the Now Playing message with new button state
+  - QueueView: unchanged (already has good pagination logic)
+  - SearchSelectView: unchanged
 """
 
 from __future__ import annotations
@@ -32,19 +35,66 @@ logger = logging.getLogger(__name__)
 class MusicControlView(discord.ui.View):
     """
     Persistent playback-control bar shown under the now-playing embed.
-    Buttons: ⏸/▶ Pause/Resume | ⏭ Skip | 🔁 Loop | 🔀 Shuffle | ⏹ Stop
+
+    Row 0: ⏸/▶ Pause/Resume | ⏭ Skip | 🔁 Loop | 🔀 Shuffle | ⏹ Stop
+    Row 1: 🔉 Vol -10%       | 🔊 Vol +10%
+
+    Buttons are dynamically enabled/disabled based on real-time player state.
     """
 
     def __init__(self, bot: "MusicBot", guild_id: int) -> None:
         super().__init__(timeout=None)
         self.bot      = bot
         self.guild_id = guild_id
+        # Sync button states on creation
+        self._sync_buttons()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _voice_client(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
         guild = self.bot.get_guild(self.guild_id)
         return guild.voice_client if guild else None
+
+    def _sync_buttons(self) -> None:
+        """
+        Update button labels and disabled states to match current player state.
+        Call this before any edit_message() to keep the UI in sync.
+        """
+        player = self.bot.get_player(self.guild_id)
+        queue_size   = len(player)
+        is_playing   = player.now_playing is not None
+
+        for child in self.children:
+            if not hasattr(child, "custom_id"):
+                continue
+            cid = child.custom_id
+
+            if cid == "mb_skip":
+                # Show queue count badge; disable when nothing to skip to
+                label = f"⏭ Skip"
+                if queue_size > 0:
+                    label = f"⏭ Skip ({queue_size})"
+                child.label    = label
+                child.disabled = not is_playing
+
+            elif cid == "mb_shuffle":
+                # Shuffle is meaningless with 0 or 1 tracks
+                child.disabled = queue_size < 2
+
+            elif cid == "mb_loop":
+                # Reflect current loop mode
+                child.label = player.loop_mode.label()
+                child.style = (
+                    discord.ButtonStyle.success
+                    if player.loop_mode.value != "off"
+                    else discord.ButtonStyle.secondary
+                )
+
+            elif cid == "mb_vol_down":
+                child.disabled = player.volume <= 0.0
+
+            elif cid == "mb_vol_up":
+                child.disabled = player.volume >= 2.0
 
     async def _check(self, interaction: discord.Interaction) -> bool:
         """Ensure the user is in the same voice channel as the bot."""
@@ -55,7 +105,6 @@ class MusicControlView(discord.ui.View):
                 ephemeral=True,
             )
             return False
-        # Guard: user must be in *any* voice channel first
         if not interaction.user.voice:
             await interaction.response.send_message(
                 embed=error_embed("Not in Voice", "You need to join a voice channel first."),
@@ -73,7 +122,19 @@ class MusicControlView(discord.ui.View):
             return False
         return True
 
-    # ── Buttons ───────────────────────────────────────────────────────────────
+    async def _refresh_view(self, interaction: discord.Interaction) -> None:
+        """Re-sync button states and edit the Now Playing message in-place."""
+        self._sync_buttons()
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.InteractionResponded:
+            # Already responded — try followup edit
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+
+    # ── Row 0: Core controls ──────────────────────────────────────────────────
 
     @discord.ui.button(
         label="⏸ Pause",
@@ -91,14 +152,12 @@ class MusicControlView(discord.ui.View):
             vc.resume()
             button.label = "⏸ Pause"
             button.style = discord.ButtonStyle.secondary
-            await interaction.response.edit_message(view=self)
         elif vc.is_playing():
             vc.pause()
             button.label = "▶ Resume"
             button.style = discord.ButtonStyle.success  # green = "press to resume"
-            await interaction.response.edit_message(view=self)
-        else:
-            await interaction.response.defer()
+        self._sync_buttons()
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(
         label="⏭ Skip",
@@ -125,7 +184,7 @@ class MusicControlView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="🔁 Loop",
+        label="🔁 Loop Off",
         style=discord.ButtonStyle.secondary,
         custom_id="mb_loop",
         row=0,
@@ -137,14 +196,7 @@ class MusicControlView(discord.ui.View):
             return
         player = self.bot.get_player(self.guild_id)
         player.loop_mode = player.loop_mode.next()
-        # Use the model's own label — no fragile manual dict here
-        button.label = player.loop_mode.label()
-        button.style = (
-            discord.ButtonStyle.success
-            if player.loop_mode.value != "off"
-            else discord.ButtonStyle.secondary
-        )
-        await interaction.response.edit_message(view=self)
+        await self._refresh_view(interaction)
 
     @discord.ui.button(
         label="🔀 Shuffle",
@@ -158,7 +210,7 @@ class MusicControlView(discord.ui.View):
         if not await self._check(interaction):
             return
         player = self.bot.get_player(self.guild_id)
-        player.shuffle()
+        await player.shuffle()
         await interaction.response.send_message(
             embed=success_embed("Shuffled", "🔀 Queue has been shuffled."),
             ephemeral=True,
@@ -190,6 +242,63 @@ class MusicControlView(discord.ui.View):
             ephemeral=True,
         )
         self.stop()
+
+    # ── Row 1: Volume controls ────────────────────────────────────────────────
+
+    @discord.ui.button(
+        label="🔉 Vol -10%",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mb_vol_down",
+        row=1,
+    )
+    async def vol_down(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not await self._check(interaction):
+            return
+        player      = self.bot.get_player(self.guild_id)
+        new_vol     = max(0.0, player.volume - 0.10)
+        player.volume = new_vol
+        vc = self._voice_client(interaction)
+        if vc and vc.source:
+            try:
+                vc.source.volume = player.volume
+            except AttributeError:
+                pass
+        self._sync_buttons()
+        await interaction.response.edit_message(view=self)
+        # Ephemeral confirmation so chat stays clean
+        await interaction.followup.send(
+            embed=success_embed("Volume", f"🔉 Set to **{int(new_vol * 100)}%**."),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="🔊 Vol +10%",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mb_vol_up",
+        row=1,
+    )
+    async def vol_up(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not await self._check(interaction):
+            return
+        player      = self.bot.get_player(self.guild_id)
+        new_vol     = min(2.0, player.volume + 0.10)
+        player.volume = new_vol
+        vc = self._voice_client(interaction)
+        if vc and vc.source:
+            try:
+                vc.source.volume = player.volume
+            except AttributeError:
+                pass
+        self._sync_buttons()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            embed=success_embed("Volume", f"🔊 Set to **{int(new_vol * 100)}%**."),
+            ephemeral=True,
+        )
 
 
 # ── Search result select ──────────────────────────────────────────────────────
