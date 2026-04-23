@@ -22,6 +22,23 @@ class LoopMode(Enum):
             LoopMode.QUEUE: "🔁 Loop Queue",
         }[self]
 
+    def short_label(self) -> str:
+        """Short label without emoji, for embed field values."""
+        return {
+            LoopMode.OFF:   "Off",
+            LoopMode.TRACK: "Track",
+            LoopMode.QUEUE: "Queue",
+        }[self]
+
+    @property
+    def emoji(self) -> str:
+        """Emoji for use in buttons and compact display."""
+        return {
+            LoopMode.OFF:   "🔁",
+            LoopMode.TRACK: "🔂",
+            LoopMode.QUEUE: "🔁🇺",
+        }[self]
+
 
 class AudioEffect(Enum):
     BASS_BOOST     = "bassboost"

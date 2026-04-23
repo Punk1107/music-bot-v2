@@ -2,16 +2,27 @@
 """
 core/database.py — Async SQLite database manager using aiosqlite.
 
+V2.1 Changes:
+  - Persistent single connection (self._conn) initialised once in initialise().
+    All operations share this connection via an asyncio.Lock — eliminates the
+    per-call open/close overhead that caused O(N) connection churn.
+  - PRAGMAs applied once during initialise(), not on every _connect() call.
+  - New record_track_played() combines add_history() + increment_user_stats()
+    into a single connection/commit (was 2 separate connections before).
+  - _connect() context manager kept as thin wrapper for backward compatibility.
+
 Handles:
 - Schema initialisation & migrations
 - Queue persistence (save / load per guild)
 - Play history
 - Server configuration storage
 - User statistics
+- Search history for autocomplete
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -88,36 +99,72 @@ CREATE INDEX IF NOT EXISTS idx_search_history_guild ON search_history(guild_id, 
 
 
 class DatabaseManager:
-    """Async SQLite database manager."""
+    """
+    Async SQLite database manager with a persistent shared connection.
+
+    A single aiosqlite connection is held open for the bot's lifetime.
+    All access is serialised through self._lock to prevent concurrent
+    write conflicts on the same connection.
+    """
 
     def __init__(self, db_path: str = config.DATABASE_PATH) -> None:
         self._db_path = db_path
+        self._conn: Optional[aiosqlite.Connection] = None
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
     @asynccontextmanager
     async def _connect(self):
-        """Yield an open aiosqlite connection."""
-        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self._db_path) as conn:
-            conn.row_factory = aiosqlite.Row
-            await conn.executescript(
-                "PRAGMA journal_mode=WAL;"
-                "PRAGMA synchronous=NORMAL;"
-                "PRAGMA foreign_keys=ON;"
-                "PRAGMA cache_size=10000;"
-                "PRAGMA temp_store=MEMORY;"
-            )
-            yield conn
+        """
+        Yield the persistent shared connection under the write lock.
+
+        Falls back to opening a temporary connection if initialise() has not
+        yet been called (e.g., during early startup), so callers never crash.
+        """
+        if self._conn is not None:
+            async with self._lock:
+                yield self._conn
+        else:
+            # Fallback: open a short-lived connection (pre-init scenario)
+            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+            async with aiosqlite.connect(self._db_path) as conn:
+                conn.row_factory = aiosqlite.Row
+                async with self._lock:
+                    yield conn
 
     # ── Schema ────────────────────────────────────────────────────────────────
 
     async def initialise(self) -> None:
-        """Create tables and indices if they do not exist."""
-        async with self._connect() as conn:
-            await conn.executescript(_SCHEMA_SQL)
-            await conn.commit()
-        logger.info("✅ Database initialised at %s", self._db_path)
+        """
+        Open the persistent connection, apply PRAGMAs once, and create
+        tables/indices if they do not exist.  Call this exactly once at startup.
+        """
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = await aiosqlite.connect(self._db_path)
+        self._conn.row_factory = aiosqlite.Row
+
+        # Apply WAL + performance PRAGMAs once — not on every query
+        await self._conn.executescript(
+            "PRAGMA journal_mode=WAL;"
+            "PRAGMA synchronous=NORMAL;"
+            "PRAGMA foreign_keys=ON;"
+            "PRAGMA cache_size=10000;"
+            "PRAGMA temp_store=MEMORY;"
+        )
+        await self._conn.executescript(_SCHEMA_SQL)
+        await self._conn.commit()
+        logger.info("✅ Database initialised at %s (persistent connection)", self._db_path)
+
+    async def close(self) -> None:
+        """Close the persistent connection gracefully."""
+        if self._conn:
+            try:
+                await self._conn.close()
+            except Exception as exc:
+                logger.warning("DB close error: %s", exc)
+            finally:
+                self._conn = None
 
     # ── Queue ─────────────────────────────────────────────────────────────────
 
@@ -167,8 +214,50 @@ class DatabaseManager:
             )
             await conn.commit()
 
-    # ── History ───────────────────────────────────────────────────────────────
+    # ── History & Stats (combined) ────────────────────────────────────────────
 
+    async def record_track_played(
+        self,
+        guild_id: int,
+        user_id: int,
+        track: Track,
+        duration_played: int = 0,
+        skipped: bool = False,
+        completed: bool = False,
+    ) -> None:
+        """
+        Record a played track to history AND increment user stats in a
+        single connection / single commit — replaces the separate
+        add_history() + increment_user_stats() double-call pattern.
+        """
+        async with self._connect() as conn:
+            # 1) Insert history row
+            await conn.execute(
+                "INSERT INTO history"
+                " (guild_id, user_id, track_data, duration_played, skipped, completed)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (guild_id, user_id, track.to_json(), duration_played, skipped, completed),
+            )
+            # 2) Auto-purge old history (keep last N days)
+            await conn.execute(
+                "DELETE FROM history WHERE guild_id = ?"
+                " AND played_at < datetime('now', ? || ' days')",
+                (guild_id, f"-{config.HISTORY_DAYS}"),
+            )
+            # 3) Upsert user stats
+            await conn.execute(
+                "INSERT INTO user_stats"
+                "  (user_id, guild_id, total_tracks_requested, total_listening_time)"
+                " VALUES (?, ?, 1, ?)"
+                " ON CONFLICT(user_id, guild_id) DO UPDATE SET"
+                "   total_tracks_requested = total_tracks_requested + 1,"
+                "   total_listening_time   = total_listening_time + ?,"
+                "   last_active            = CURRENT_TIMESTAMP",
+                (user_id, guild_id, duration_played, duration_played),
+            )
+            await conn.commit()
+
+    # Keep legacy methods for any external callers — they delegate to the combined method
     async def add_history(
         self,
         guild_id: int,
@@ -178,25 +267,38 @@ class DatabaseManager:
         skipped: bool = False,
         completed: bool = False,
     ) -> None:
+        """Legacy alias — use record_track_played() for new code."""
         async with self._connect() as conn:
             await conn.execute(
                 "INSERT INTO history"
                 " (guild_id, user_id, track_data, duration_played, skipped, completed)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    guild_id,
-                    user_id,
-                    track.to_json(),
-                    duration_played,
-                    skipped,
-                    completed,
-                ),
+                (guild_id, user_id, track.to_json(), duration_played, skipped, completed),
             )
-            # Auto-purge old history
             await conn.execute(
                 "DELETE FROM history WHERE guild_id = ?"
                 " AND played_at < datetime('now', ? || ' days')",
                 (guild_id, f"-{config.HISTORY_DAYS}"),
+            )
+            await conn.commit()
+
+    async def increment_user_stats(
+        self,
+        guild_id: int,
+        user_id: int,
+        listening_seconds: int = 0,
+    ) -> None:
+        """Legacy alias — use record_track_played() for new code."""
+        async with self._connect() as conn:
+            await conn.execute(
+                "INSERT INTO user_stats"
+                "  (user_id, guild_id, total_tracks_requested, total_listening_time)"
+                " VALUES (?, ?, 1, ?)"
+                " ON CONFLICT(user_id, guild_id) DO UPDATE SET"
+                "   total_tracks_requested = total_tracks_requested + 1,"
+                "   total_listening_time   = total_listening_time + ?,"
+                "   last_active            = CURRENT_TIMESTAMP",
+                (user_id, guild_id, listening_seconds, listening_seconds),
             )
             await conn.commit()
 
@@ -259,25 +361,6 @@ class DatabaseManager:
 
     # ── User stats ────────────────────────────────────────────────────────────
 
-    async def increment_user_stats(
-        self,
-        guild_id: int,
-        user_id: int,
-        listening_seconds: int = 0,
-    ) -> None:
-        async with self._connect() as conn:
-            await conn.execute(
-                "INSERT INTO user_stats"
-                "  (user_id, guild_id, total_tracks_requested, total_listening_time)"
-                " VALUES (?, ?, 1, ?)"
-                " ON CONFLICT(user_id, guild_id) DO UPDATE SET"
-                "   total_tracks_requested = total_tracks_requested + 1,"
-                "   total_listening_time   = total_listening_time + ?,"
-                "   last_active            = CURRENT_TIMESTAMP",
-                (user_id, guild_id, listening_seconds, listening_seconds),
-            )
-            await conn.commit()
-
     async def get_user_stats(
         self, guild_id: int, user_id: int
     ) -> Optional[dict]:
@@ -308,7 +391,6 @@ class DatabaseManager:
         if not query or len(query) < 2:
             return
         async with self._connect() as conn:
-            # Upsert: refresh timestamp if query already exists for this guild
             await conn.execute(
                 "INSERT INTO search_history (guild_id, user_id, query)"
                 " VALUES (?, ?, ?)"

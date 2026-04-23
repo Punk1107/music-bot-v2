@@ -149,7 +149,7 @@ class YouTubeExtractor:
         if timeout is None:
             timeout = config.YTDL_TIMEOUT
 
-        cache_key = f"{query}::{id(opts)}"
+        cache_key = f"{query}::{sorted(opts.items())}"
 
         if use_cache:
             async with self._cache_lock:
@@ -325,7 +325,13 @@ class YouTubeExtractor:
         return tracks
 
     async def get_playlist(self, url: str, max_tracks: int = 50) -> list[Track]:
-        """Extract up to *max_tracks* tracks from a YouTube playlist."""
+        """
+        Extract up to *max_tracks* tracks from a YouTube playlist.
+
+        V2.1 optimisation: uses a single flat extraction pass instead of
+        individual metadata fetches per track.  Full metadata (stream URL)
+        is resolved lazily at playback time via get_stream_url().
+        """
         logger.info("Extracting playlist (max %d): %s", max_tracks, url)
         loop = asyncio.get_running_loop()
         try:
@@ -347,24 +353,30 @@ class YouTubeExtractor:
         for entry in result["entries"][:max_tracks]:
             if not entry:
                 continue
+            title = entry.get("title") or entry.get("ie_key", "Unknown")
+            # Prefer webpage_url; fall back to constructing from video id
+            video_id  = entry.get("id", "")
             video_url = (
                 entry.get("url")
                 or entry.get("webpage_url")
-                or f"https://www.youtube.com/watch?v={entry.get('id', '')}"
+                or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None)
             )
-            try:
-                # Fetch full metadata for each playlist track
-                full_info = await self._extract(
-                    video_url,
-                    opts={**_META_OPTS, "extract_flat": False},
-                )
-                if not full_info:
-                    continue
-                track = self._entry_to_track(full_info)
-                if track:
-                    tracks.append(track)
-            except Exception as exc:
-                logger.debug("Skipping playlist entry: %s", exc)
+            if not video_url or not title:
+                continue
+            # Duration from flat entry (may be 0 for live/unavailable entries)
+            duration = int(entry.get("duration") or 0)
+            if duration > config.MAX_TRACK_LENGTH:
+                continue  # Skip tracks that exceed length limit
+            track = Track(
+                title       = title,
+                url         = video_url,
+                duration    = duration,
+                thumbnail   = entry.get("thumbnail"),
+                uploader    = entry.get("uploader") or entry.get("channel", "Unknown"),
+                view_count  = entry.get("view_count"),
+                upload_date = entry.get("upload_date"),
+            )
+            tracks.append(track)
 
-        logger.info("Extracted %d/%d tracks from playlist", len(tracks), max_tracks)
+        logger.info("Extracted %d/%d tracks from playlist (flat)", len(tracks), max_tracks)
         return tracks

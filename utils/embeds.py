@@ -3,6 +3,12 @@
 utils/embeds.py — Discord embed factories.
 
 All embed colours come from config so they stay consistent across the bot.
+Changes in V2.1 refactor:
+  - now_playing_embed uses COLOR_NOW_PLAYING (purple) for visual distinction
+  - search/info embeds use COLOR_INFO (cyan)
+  - Footer no longer hardcodes "Recently added"
+  - loop field uses LoopMode.short_label() instead of brittle .replace() hack
+  - track_added_embed accepts is_first=True to show "▶ Now Playing" title
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ def now_playing_embed(
     elapsed:      int = 0,
     requester:    Optional[discord.Member] = None,
     loop_label:   str = "🔁 Loop Off",
+    loop_short:   str = "Off",
     effects:      list[str] | None = None,
     volume:       float = 0.75,
     quality:      str = "MEDIUM",
@@ -63,7 +70,7 @@ def now_playing_embed(
     e = discord.Embed(
         title       = "🎵 Now Playing",
         description = f"**[{truncate(track.title, 80)}]({track.url})**",
-        colour      = config.COLOR_PRIMARY,
+        colour      = config.COLOR_NOW_PLAYING,
     )
 
     if track.thumbnail:
@@ -78,7 +85,7 @@ def now_playing_embed(
     if requester:
         e.add_field(
             name="👤 Requested by",
-            value=f"@{requester.display_name}",
+            value=f"{requester.mention}",
             inline=True,
         )
     if channel_name:
@@ -99,7 +106,8 @@ def now_playing_embed(
         + (f" • {fmt_duration(queue_dur)}" if queue_dur else " • Live")
     )
     e.add_field(name="📋 Queue", value=queue_value, inline=True)
-    e.add_field(name="🔁 Loop",  value=loop_label.replace("🔁 ", "").replace("🔂 ", ""), inline=True)
+    # Use short_loop directly — no emoji stripping needed
+    e.add_field(name="🔁 Loop", value=loop_short, inline=True)
 
     # Row 3 — Settings (Volume + Quality) spanning full width
     settings_value = f"Volume: {int(volume * 100)}% • Quality: {quality}"
@@ -116,11 +124,11 @@ def now_playing_embed(
 
     if requester:
         e.set_footer(
-            text     = f"Enhanced Music Bot • Recently added",
+            text     = "Music Bot V2",
             icon_url = requester.display_avatar.url,
         )
     else:
-        e.set_footer(text="Enhanced Music Bot")
+        e.set_footer(text="Music Bot V2")
 
     e.timestamp = datetime.now(timezone.utc)
     return e
@@ -172,7 +180,8 @@ def queue_embed(
 
 def search_results_embed(tracks: list[Track], query: str) -> discord.Embed:
     e = discord.Embed(
-        title       = f"🔍 Search results for: {truncate(query, 50)}",
+        title       = f"🔍 Search: {truncate(query, 50)}",
+        description = "Select a track from the dropdown below.",
         colour      = config.COLOR_INFO,
         timestamp   = datetime.now(timezone.utc),
     )
@@ -182,7 +191,7 @@ def search_results_embed(tracks: list[Track], query: str) -> discord.Embed:
             f"`{i}.` **{truncate(t.title, 60)}**  ·  "
             f"`{fmt_duration(t.duration)}`  ·  {t.uploader}"
         )
-    e.description = "\n".join(lines) or "_No results found._"
+    e.add_field(name="Results", value="\n".join(lines) or "_No results found._", inline=False)
     return e
 
 
@@ -194,11 +203,16 @@ def track_added_embed(
     channel_name: str = "",
     queue_count:  int = 0,
     queue_dur:    int = 0,
+    is_first:     bool = False,   # True when this track starts playing immediately
 ) -> discord.Embed:
+    # Dynamic title: distinguish "playing now" from "queued"
+    title  = "▶ Now Playing" if is_first else "➕ Added to Queue"
+    colour = config.COLOR_NOW_PLAYING if is_first else config.COLOR_SUCCESS
+
     e = discord.Embed(
-        title       = "➕ Added to Queue",
+        title       = title,
         description = f"**[{truncate(track.title, 70)}]({track.url})**",
-        colour      = config.COLOR_SUCCESS,
+        colour      = colour,
     )
     if track.thumbnail:
         e.set_thumbnail(url=track.thumbnail)
@@ -206,7 +220,7 @@ def track_added_embed(
     # Row 1 — Duration | Requested by | Channel
     e.add_field(name="⏱ Duration", value=fmt_duration(track.duration), inline=True)
     if requester:
-        e.add_field(name="👤 Requested by", value=f"@{requester.display_name}", inline=True)
+        e.add_field(name="👤 Requested by", value=requester.mention, inline=True)
     if channel_name:
         e.add_field(name="📺 Channel", value=channel_name, inline=True)
 
@@ -217,15 +231,16 @@ def track_added_embed(
         + (f" • {fmt_duration(queue_dur)}" if queue_dur else "")
     )
     e.add_field(name="📋 Queue",    value=queue_value, inline=True)
-    e.add_field(name="📌 Position", value=f"#{position}",              inline=True)
+    pos_str = "▶ Up next" if is_first else f"#{position}"
+    e.add_field(name="📌 Position", value=pos_str, inline=True)
 
     if requester:
         e.set_footer(
-            text     = "Enhanced Music Bot",
+            text     = "Music Bot V2",
             icon_url = requester.display_avatar.url,
         )
     else:
-        e.set_footer(text="Enhanced Music Bot")
+        e.set_footer(text="Music Bot V2")
 
     e.timestamp = datetime.now(timezone.utc)
     return e
@@ -270,18 +285,19 @@ def help_embed() -> discord.Embed:
         name  = "📋 Queue",
         value = (
             "`/queue [page]` · `/shuffle` · `/clear`\n"
-            "`/loop` · `/remove <position>`"
+            "`/loop` · `/remove <position>` · `/move <from> <to>`"
         ),
         inline=False,
     )
     e.add_field(
         name  = "🎛 Audio",
-        value = "`/volume <0-200>` · `/effects <effect>`",
+        value = "`/volume <0-200>` · `/effects <effect>` · `/effects_clear` · `/effects_list`",
         inline=False,
     )
     e.add_field(
         name  = "📊 Info",
-        value = "`/nowplaying` · `/history` · `/help`",
+        value = "`/nowplaying` · `/history` · `/stats` · `/help`",
         inline=False,
     )
+    e.set_footer(text="Music Bot V2 — Use /help for this menu at any time.")
     return e

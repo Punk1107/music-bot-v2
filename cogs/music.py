@@ -9,15 +9,20 @@ Commands:
   /search  — Interactive search with dropdown selection
   /pause   — Pause playback
   /resume  — Resume playback
-  /skip    — Skip the current track
+  /skip    — Skip the current track (ephemeral response)
   /stop    — Stop playback, clear queue, stay connected
 
-V2 Improvements:
-  - Now Playing embed is edited in-place (no chat spam)
-  - /play has smart autocomplete from search history
-  - _play_next has skip_depth limit to prevent infinite recursion
-  - Graceful error embeds on every failure path
-  - Progress task is cancelled immediately on skip
+V2.1 Changes:
+  - play/search defer with thinking=True for better UX on slow I/O
+  - _play_next guards against vc.is_playing() race condition
+  - record_track_played() replaces double DB call (add_history + increment_user_stats)
+  - after_play checks bot._shutdown before scheduling next track
+  - now_playing_embed passes loop_short from LoopMode.short_label()
+  - track_added_embed receives is_first=True when track plays immediately
+  - /skip success response is ephemeral to reduce channel noise
+  - Hardcoded Thai error text replaced with bilingual error_embed()
+  - Progress task uses config.PROGRESS_BAR_UPDATE_INTERVAL constant
+  - Fire-and-forget DB task has error callback to avoid silent failures
 """
 
 from __future__ import annotations
@@ -121,6 +126,13 @@ class MusicCog(commands.Cog, name="Music"):
             player.reset()
             return
 
+        # Race condition guard: don't start a second track if one is already playing
+        if vc.is_playing():
+            logger.debug(
+                "guild %d: _play_next called while already playing — ignoring.", guild_id
+            )
+            return
+
         # Finish the previous track (handles loop logic inside GuildPlayer)
         player.finish_track()
 
@@ -134,7 +146,7 @@ class MusicCog(commands.Cog, name="Music"):
             stream_url = await self.bot.youtube.get_stream_url(next_track.url)
         except Exception as exc:
             logger.error("Failed to resolve stream for '%s': %s", next_track.title, exc)
-            # Guard against infinite recursion (Bug #1)
+            # Guard against infinite recursion
             if skip_depth >= config.SKIP_ERROR_LIMIT:
                 logger.error(
                     "Reached skip limit (%d) for guild %d — stopping playback.",
@@ -173,9 +185,15 @@ class MusicCog(commands.Cog, name="Music"):
         def after_play(exc: Optional[Exception]) -> None:
             if exc:
                 logger.error("Playback error in guild %d: %s", guild_id, exc)
-            asyncio.run_coroutine_threadsafe(
-                self._play_next(guild_id), self.bot.loop
-            )
+            # Guard against scheduling into a closed loop (e.g. during shutdown)
+            if self.bot._shutdown:
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._play_next(guild_id), self.bot.loop
+                )
+            except RuntimeError:
+                logger.debug("Could not schedule _play_next — event loop closed.")
 
         try:
             source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts)
@@ -186,11 +204,11 @@ class MusicCog(commands.Cog, name="Music"):
                 await self._play_next(guild_id, skip_depth=skip_depth + 1)
             return
 
-        # Save to DB history
-        await self.bot.db.add_history(
-            guild_id, next_track.requester_id, next_track
-        )
-        await self.bot.db.increment_user_stats(guild_id, next_track.requester_id)
+        # ── Save to DB history (combined call — single connection/commit) ─────
+        try:
+            await self.bot.db.record_track_played(guild_id, next_track.requester_id, next_track)
+        except Exception as exc:
+            logger.warning("Failed to record track played for guild %d: %s", guild_id, exc)
 
         # Cancel any previous progress-bar updater for this guild
         if player.progress_task and not player.progress_task.done():
@@ -202,22 +220,23 @@ class MusicCog(commands.Cog, name="Music"):
             try:
                 cfg = await self.bot.get_server_config(guild_id)
                 if cfg.announce_songs:
-                    # Resolve requester member object for avatar/name
+                    # Resolve requester member object — cache-first, no fetch
                     requester_member: Optional[discord.Member] = None
                     if next_track.requester_id:
-                        try:
-                            requester_member = (
-                                guild.get_member(next_track.requester_id)
-                                or await guild.fetch_member(next_track.requester_id)
-                            )
-                        except Exception:
-                            pass
+                        requester_member = guild.get_member(next_track.requester_id)
+                        # Only fetch if not in cache AND members intent is enabled
+                        if requester_member is None:
+                            try:
+                                requester_member = await guild.fetch_member(next_track.requester_id)
+                            except discord.HTTPException:
+                                pass  # Non-critical — embed works fine without member
 
                     embed = now_playing_embed(
                         next_track,
                         elapsed      = 0,
                         requester    = requester_member,
                         loop_label   = player.loop_mode.label(),
+                        loop_short   = player.loop_mode.short_label(),
                         effects      = [e.display_name for e in player.effects],
                         volume       = player.volume,
                         quality      = player.quality,
@@ -227,9 +246,7 @@ class MusicCog(commands.Cog, name="Music"):
                     )
                     view = MusicControlView(self.bot, guild_id)
 
-                    # ── Always send a fresh Now Playing message ───────────────
-                    # A new embed is sent for every new track so each song
-                    # gets its own message in the channel history.
+                    # Always send a fresh Now Playing message for each track
                     msg = await player.text_channel.send(embed=embed, view=view)
 
                     player.now_playing_msg    = msg
@@ -246,16 +263,15 @@ class MusicCog(commands.Cog, name="Music"):
 
     async def _update_progress_bar(self, guild_id: int) -> None:
         """
-        Background task: edit the now-playing message every 7 seconds to
+        Background task: edit the now-playing message every N seconds to
         show the live progress bar.  Stops automatically when the track ends,
         is skipped, or the now-playing message is deleted by a user.
         """
-        UPDATE_INTERVAL = 7  # seconds between edits
         player = self.bot.get_player(guild_id)
         guild  = self.bot.get_guild(guild_id)
 
         while True:
-            await asyncio.sleep(UPDATE_INTERVAL)
+            await asyncio.sleep(config.PROGRESS_BAR_UPDATE_INTERVAL)
 
             # Stop if the track finished or the message reference was cleared
             if player.now_playing is None or player.now_playing_msg is None:
@@ -277,6 +293,7 @@ class MusicCog(commands.Cog, name="Music"):
                     elapsed      = elapsed,
                     requester    = requester_member,
                     loop_label   = player.loop_mode.label(),
+                    loop_short   = player.loop_mode.short_label(),
                     effects      = [e.display_name for e in player.effects],
                     volume       = player.volume,
                     quality      = player.quality,
@@ -292,8 +309,6 @@ class MusicCog(commands.Cog, name="Music"):
 
             except discord.NotFound:
                 # The Now Playing message was deleted by a user.
-                # Clear the reference so future iterations don't try again,
-                # and stop the task silently — no error spam.
                 logger.debug(
                     "Now-playing message deleted in guild %d — stopping progress task.",
                     guild_id,
@@ -303,7 +318,7 @@ class MusicCog(commands.Cog, name="Music"):
                 return
 
             except discord.HTTPException as exc:
-                # Transient API hiccup (rate-limit, 5xx, etc.) — log and keep going.
+                # Transient API hiccup (rate-limit, 5xx) — log and keep going.
                 logger.debug("Progress bar HTTP error in guild %d: %s", guild_id, exc)
 
             except Exception as exc:
@@ -337,7 +352,7 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="join", description="Join your voice channel.")
     async def join(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         if not interaction.user.voice:
             await interaction.followup.send(
                 embed=error_embed("Not in Voice Channel",
@@ -376,12 +391,13 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.describe(query="YouTube/Spotify URL or search keywords")
     @app_commands.autocomplete(query=_play_autocomplete)
     async def play(self, interaction: discord.Interaction, query: str) -> None:
-        await interaction.response.defer()
+        # thinking=True shows the animated "Bot is thinking…" spinner during I/O
+        await interaction.response.defer(thinking=True)
 
         if self._rate_check(interaction):
             secs = self.rate_limiter.retry_after(interaction.guild_id, interaction.user.id)
             await interaction.followup.send(
-                embed=error_embed("Slow down!", f"Try again in {secs:.1f}s."),
+                embed=error_embed("Slow Down!", f"Try again in **{secs:.1f}s**."),
                 ephemeral=True,
             )
             return
@@ -484,8 +500,10 @@ class MusicCog(commands.Cog, name="Music"):
                 track = await self.bot.youtube.get_track(query)
             except Exception as exc:
                 await interaction.followup.send(
-                    embed=error_embed("❌ ดึงข้อมูลไม่ได้",
-                                      f"ไม่สามารถดึงข้อมูลจาก URL นี้ได้: {exc}"),
+                    embed=error_embed(
+                        "Could Not Load URL",
+                        f"Failed to extract info from that link.\n*(ไม่สามารถดึงข้อมูลจาก URL นี้ได้)*",
+                    ),
                     ephemeral=True,
                 )
                 return
@@ -497,19 +515,21 @@ class MusicCog(commands.Cog, name="Music"):
                 return
             if len(player) >= cfg.max_queue_size:
                 await interaction.followup.send(
-                    embed=error_embed("Queue Full", f"Maximum {cfg.max_queue_size} tracks."),
+                    embed=error_embed("Queue Full", f"Maximum **{cfg.max_queue_size}** tracks."),
                     ephemeral=True,
                 )
                 return
             track.requester_id = interaction.user.id
             player.enqueue(track)
             pos = len(player)
+            is_first = not vc.is_playing() and not vc.is_paused()
             await interaction.followup.send(embed=track_added_embed(
                 track, pos,
                 requester    = interaction.user,
                 channel_name = track.uploader or "",
                 queue_count  = len(player),
                 queue_dur    = player.queue_duration(),
+                is_first     = is_first,
             ))
 
         # ── Search query ────────────────────────────────────────────────────────
@@ -526,27 +546,35 @@ class MusicCog(commands.Cog, name="Music"):
             track.requester_id = interaction.user.id
             if len(player) >= cfg.max_queue_size:
                 await interaction.followup.send(
-                    embed=error_embed("Queue Full", f"Maximum {cfg.max_queue_size} tracks."),
+                    embed=error_embed("Queue Full", f"Maximum **{cfg.max_queue_size}** tracks."),
                     ephemeral=True,
                 )
                 return
             player.enqueue(track)
             pos = len(player)
+            is_first = not vc.is_playing() and not vc.is_paused()
             await interaction.followup.send(embed=track_added_embed(
                 track, pos,
                 requester    = interaction.user,
                 channel_name = track.uploader or "",
                 queue_count  = len(player),
                 queue_dur    = player.queue_duration(),
+                is_first     = is_first,
             ))
 
-        # Save search query to history for autocomplete (non-blocking)
+        # Save search query to history for autocomplete — fire-and-forget with error logging
         if not query.startswith("http"):
-            asyncio.create_task(
+            def _on_save_error(task: asyncio.Task) -> None:
+                exc = task.exception()
+                if exc:
+                    logger.debug("save_search_query failed: %s", exc)
+
+            task = asyncio.create_task(
                 self.bot.db.save_search_query(
                     interaction.guild_id, interaction.user.id, query
                 )
             )
+            task.add_done_callback(_on_save_error)
 
         # ── Start playback if nothing is playing ─────────────────────────────────
         if not vc.is_playing() and not vc.is_paused():
@@ -555,7 +583,8 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.command(name="search", description="Search YouTube and choose a track from a list.")
     @app_commands.describe(query="Search keywords")
     async def search(self, interaction: discord.Interaction, query: str) -> None:
-        await interaction.response.defer()
+        # thinking=True shows the animated spinner during YouTube search I/O
+        await interaction.response.defer(thinking=True)
 
         sq = validate_search_query(query)
         if not sq:
@@ -587,20 +616,22 @@ class MusicCog(commands.Cog, name="Music"):
             cfg = await self.bot.get_server_config(interaction.guild_id)
             if len(player) >= cfg.max_queue_size:
                 await interaction.followup.send(
-                    embed=error_embed("Queue Full", f"Max {cfg.max_queue_size} tracks."),
+                    embed=error_embed("Queue Full", f"Max **{cfg.max_queue_size}** tracks."),
                     ephemeral=True,
                 )
                 return
             player.enqueue(track)
             pos = len(player)
+            is_first = not vc.is_playing() and not vc.is_paused()
             await interaction.followup.send(embed=track_added_embed(
                 track, pos,
                 requester    = interaction.user,
                 channel_name = track.uploader or "",
                 queue_count  = len(player),
                 queue_dur    = player.queue_duration(),
+                is_first     = is_first,
             ))
-            if not vc.is_playing() and not vc.is_paused():
+            if is_first:
                 await self._play_next(interaction.guild_id)
 
         view = SearchSelectView(results, on_select)
@@ -637,14 +668,16 @@ class MusicCog(commands.Cog, name="Music"):
     async def skip(self, interaction: discord.Interaction) -> None:
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
-            # Cancel progress task before stopping (Bug #4)
+            # Cancel progress task before stopping
             player = self.bot.get_player(interaction.guild_id)
             if player.progress_task and not player.progress_task.done():
                 player.progress_task.cancel()
                 player.progress_task = None
             vc.stop()  # triggers after_play → _play_next
+            # Ephemeral: no need to announce a skip publicly
             await interaction.response.send_message(
-                embed=success_embed("Skipped", "⏭ Skipped to the next track.")
+                embed=success_embed("Skipped", "⏭ Skipped to the next track."),
+                ephemeral=True,
             )
         else:
             await interaction.response.send_message(

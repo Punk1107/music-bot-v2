@@ -101,6 +101,7 @@ class MusicBot(commands.Bot):
     async def get_server_config(self, guild_id: int) -> ServerConfig:
         if guild_id not in self._config_cache:
             self._config_cache[guild_id] = await self.db.get_server_config(guild_id)
+            self._evict_config_cache_if_needed()
         return self._config_cache[guild_id]
 
     async def save_server_config(self, cfg: ServerConfig) -> None:
@@ -146,13 +147,13 @@ class MusicBot(commands.Bot):
         )
 
     async def close(self) -> None:
-        """Graceful shutdown: persist all queues before disconnecting."""
+        """Graceful shutdown: persist all queues and close DB before disconnecting."""
         if self._shutdown:
             return
         self._shutdown = True
         logger.info("Shutting down…")
 
-        for guild_id, player in self._players.items():
+        for guild_id, player in list(self._players.items()):
             try:
                 guild = self.get_guild(guild_id)
                 if guild and player.now_playing:
@@ -166,6 +167,12 @@ class MusicBot(commands.Bot):
                     )
             except Exception as exc:
                 logger.warning("Failed to persist queue for guild %d: %s", guild_id, exc)
+
+        # Close the persistent DB connection cleanly
+        try:
+            await self.db.close()
+        except Exception as exc:
+            logger.warning("DB close error during shutdown: %s", exc)
 
         await super().close()
         logger.info("Bot disconnected cleanly.")
@@ -197,6 +204,13 @@ class MusicBot(commands.Bot):
         """Clean up state when the bot is removed from a guild."""
         self._players.pop(guild.id, None)
         self._config_cache.pop(guild.id, None)
+
+    def _evict_config_cache_if_needed(self) -> None:
+        """Evict the oldest entry when the config cache exceeds 100 guilds."""
+        max_size = 100
+        if len(self._config_cache) > max_size:
+            oldest_key = next(iter(self._config_cache))
+            del self._config_cache[oldest_key]
 
     async def on_application_command_error(
         self, interaction: discord.Interaction, error: Exception
@@ -260,23 +274,30 @@ class MusicBot(commands.Bot):
                 player.reset()
                 await vc.disconnect()
 
-                # 4) Send farewell message (auto-deletes after 15s)
+                # 4) Send bilingual farewell message (auto-deletes after 15s)
                 if player.text_channel:
                     try:
+                        idle_mins = int(idle_secs // 60)
                         farewell_embed = discord.Embed(
-                            title       = "💤 ออกจากห้องเสียงแล้ว",
+                            title       = "💤 Left Voice Channel — Idle Timeout",
                             description = (
-                                f"บอทไม่มีคนฟังนานกว่า **{int(idle_secs // 60)} นาที**\n"
-                                "ออกจากห้องเสียงเพื่อประหยัดทรัพยากรแล้วนะครับ \u2764"
+                                f"No listeners for **{idle_mins} minute{'s' if idle_mins != 1 else ''}** — "
+                                "disconnected to save resources.\n"
+                                f"*(บอทไม่มีคนฟังนานกว่า **{idle_mins} นาที** "
+                                "ออกจากห้องเสียงเพื่อประหยัดทรัพยากรแล้วนะครับ \u2764)*"
                             ),
                             colour      = 0xFEE75C,
                         )
-                        farewell_embed.set_footer(text="พิมพ์ /play เมื่อพร้อมฟังอีกครั้งนะครับ")
+                        farewell_embed.set_footer(
+                            text="Use /play when you're ready to listen again.  "
+                                 "*(พิมพ์ /play เมื่อพร้อมฟังอีกครั้งนะครับ)*"
+                        )
                         await player.text_channel.send(
                             embed=farewell_embed, delete_after=15.0
                         )
                     except Exception:
                         pass
+
 
     @_idle_checker.before_loop
     async def _before_idle_checker(self) -> None:
