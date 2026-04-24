@@ -142,7 +142,7 @@ class EffectsCog(commands.Cog, name="Effects"):
             colour      = 0x5865F2,
         )
         embed.set_footer(text="Use /effects <name> to toggle. Changes apply from the next track.")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed)
 
 
 async def setup(bot: "MusicBot") -> None:

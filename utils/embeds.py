@@ -245,24 +245,30 @@ def queue_embed(
     chunk = tracks[start: start + per_page]
 
     e = discord.Embed(
-        title     = f"📋  Queue — {guild_name}",
         colour    = 0x5865F2,
         timestamp = datetime.now(timezone.utc),
     )
+    e.set_author(name=f"📋 Queue — {guild_name}" if guild_name else "📋 Queue")
 
     if now_playing:
         e.add_field(
             name  = "🎵  Now Playing",
-            value = f"**{truncate(now_playing.title, 60)}** `{fmt_duration(now_playing.duration)}`",
+            value = f"**{truncate(now_playing.title, 55)}** `{fmt_duration(now_playing.duration)}`",
             inline= False,
         )
 
     if not chunk:
-        e.description = "*The queue is empty.*"
+        e.description = "*The queue is empty. Use `/play` to add tracks!*"
     else:
+        # Numbered emojis for positions 1-10; fall back to backtick numbers beyond that
+        num_emoji = ["1⃣","2⃣","3⃣","4⃣","5⃣","6⃣","7⃣","8⃣","9⃣","🔟"]
         lines = []
         for i, t in enumerate(chunk, start=start + 1):
-            lines.append(f"`{i:>2}.` **{truncate(t.title, 52)}** `{fmt_duration(t.duration)}`")
+            icon = num_emoji[i - 1] if 1 <= i <= 10 else f"`{i:>2}.`"
+            tag  = " ★ **Up Next**" if i == 1 else ""
+            lines.append(
+                f"{icon} **{truncate(t.title, 50)}**{tag} — `{fmt_duration(t.duration)}`"
+            )
         e.description = "\n".join(lines)
 
     e.set_footer(
@@ -278,19 +284,22 @@ def queue_embed(
 # ── Search Results ────────────────────────────────────────────────────────────
 
 def search_results_embed(tracks: list[Track], query: str) -> discord.Embed:
+    num_emoji = ["1⃣","2⃣","3⃣","4⃣","5⃣","6⃣","7⃣","8⃣","9⃣","🔟"]
     e = discord.Embed(
-        title       = f"🔍  Search: {truncate(query, 50)}",
-        description = "Select a track from the dropdown below.",
-        colour      = 0x3498DB,
+        title       = f"🔍  Results for: {truncate(query, 45)}",
+        description = "Select a track from the dropdown below:",
+        colour      = 0x5865F2,
         timestamp   = datetime.now(timezone.utc),
     )
     lines = []
-    for i, t in enumerate(tracks[:10], 1):
+    for i, t in enumerate(tracks[:10]):
+        icon = num_emoji[i] if i < 10 else f"`{i+1}.`"
         lines.append(
-            f"`{i}.` **{truncate(t.title, 55)}**\n"
-            f"    └ `{fmt_duration(t.duration)}`  ·  *{truncate(t.uploader, 30)}*"
+            f"{icon} **{truncate(t.title, 52)}**\n"
+            f"  └ `{fmt_duration(t.duration)}`  ·  {fmt_views(t.view_count)}  ·  *{truncate(t.uploader, 28)}*"
         )
-    e.add_field(name="Results", value="\n".join(lines) or "*No results found.*", inline=False)
+    e.add_field(name="​", value="\n".join(lines) or "*No results found.*", inline=False)
+    e.set_footer(text="Results are pulled live from YouTube.")
     return e
 
 
@@ -318,38 +327,72 @@ def history_embed(entries: list[dict], guild_name: str = "") -> discord.Embed:
 
 def help_embed() -> discord.Embed:
     e = discord.Embed(
-        title       = "🎵  Music Bot V2 — Commands",
-        description = "All commands use Discord slash commands (`/`)",
         colour      = 0x5865F2,
+        description = (
+            "### 🎵  Music Bot V2 — Command Reference\n"
+            "> A premium music experience for your Discord server.\n"
+            "> Use slash commands (`/`) to get started."
+        ),
         timestamp   = datetime.now(timezone.utc),
     )
 
+    # ── Playback ─────────────────────────────────────────────────────────────
     e.add_field(
-        name  = "🎶  Playback",
-        value = (
-            "`/join` · `/leave`\n"
-            "`/play <query|URL>` · `/search <query>`\n"
-            "`/pause` · `/resume` · `/skip` · `/stop`"
-        ),
-        inline=False,
+        name  = "🎶  Connect",
+        value = "`/join`  `/leave`",
+        inline= True,
     )
+    e.add_field(
+        name  = "▶️  Play",
+        value = "`/play <url|search>`  `/search`",
+        inline= True,
+    )
+    e.add_field(
+        name  = "⏯  Transport",
+        value = "`/pause`  `/resume`  `/skip`  `/stop`",
+        inline= True,
+    )
+
+    # ── Queue row ────────────────────────────────────────────────────────────
     e.add_field(
         name  = "📋  Queue",
+        value = "`/queue [page]`  `/clear`  `/remove <pos>`",
+        inline= True,
+    )
+    e.add_field(
+        name  = "🔀  Order",
+        value = "`/shuffle`  `/move <from> <to>`  `/loop`",
+        inline= True,
+    )
+    e.add_field(
+        name  = "🎚  Audio",
+        value = "`/volume <0-200>`  `/effects`  `/effects_clear`",
+        inline= True,
+    )
+
+    # ── Info row ─────────────────────────────────────────────────────────────
+    e.add_field(
+        name  = "📊  Info & Stats",
+        value = "`/nowplaying`  `/history`  `/stats`  `/help`",
+        inline= True,
+    )
+    e.add_field(
+        name  = "🎛  Effects List",
+        value = "`/effects_list`  — see all available audio FX",
+        inline= True,
+    )
+    e.add_field(name="\u200b", value="\u200b", inline=True)  # spacer to complete the row
+
+    # ── Tips ─────────────────────────────────────────────────────────────────
+    e.add_field(
+        name  = "💡  Tips",
         value = (
-            "`/queue [page]` · `/shuffle` · `/clear`\n"
-            "`/loop` · `/remove <position>` · `/move <from> <to>`"
+            "> • The **Now Playing** panel has live buttons — no commands needed\n"
+            "> • `/play` accepts YouTube URLs, playlists, Spotify links, or keywords\n"
+            "> • Volume buttons on the panel update in real-time without re-queuing"
         ),
-        inline=False,
+        inline= False,
     )
-    e.add_field(
-        name  = "🎛  Audio",
-        value = "`/volume <0-200>` · `/effects <effect>` · `/effects_clear` · `/effects_list`",
-        inline=False,
-    )
-    e.add_field(
-        name  = "📊  Info",
-        value = "`/nowplaying` · `/history` · `/stats` · `/help`",
-        inline=False,
-    )
-    e.set_footer(text="Music Bot V2  —  Use /help for this menu at any time.")
+
+    e.set_footer(text="Music Bot V2  —  Tip: click a button on the Now Playing panel for instant controls.")
     return e

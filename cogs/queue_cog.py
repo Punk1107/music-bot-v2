@@ -50,7 +50,6 @@ class QueueCog(commands.Cog, name="Queue"):
         if player.is_empty() and player.now_playing is None:
             await interaction.response.send_message(
                 embed=info_embed("Queue Empty", "The queue is currently empty. Use `/play` to add songs."),
-                ephemeral=True,
             )
             return
 

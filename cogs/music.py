@@ -718,7 +718,7 @@ class MusicCog(commands.Cog, name="Music"):
         if vc and vc.is_playing():
             vc.pause()
             await interaction.response.send_message(
-                embed=success_embed("Paused", "Playback paused."), ephemeral=True
+                embed=success_embed("Paused", "Playback paused.")
             )
         else:
             await interaction.response.send_message(
@@ -732,7 +732,7 @@ class MusicCog(commands.Cog, name="Music"):
         if vc and vc.is_paused():
             vc.resume()
             await interaction.response.send_message(
-                embed=success_embed("Resumed", "Playback resumed."), ephemeral=True
+                embed=success_embed("Resumed", "Playback resumed.")
             )
         else:
             await interaction.response.send_message(
@@ -749,10 +749,8 @@ class MusicCog(commands.Cog, name="Music"):
                 player.progress_task.cancel()
                 player.progress_task = None
             vc.stop()  # triggers after_play → _play_next
-            # Ephemeral: no need to announce a skip publicly
             await interaction.response.send_message(
-                embed=success_embed("Skipped", "⏭ Skipped to the next track."),
-                ephemeral=True,
+                embed=success_embed("Skipped", "⏭ Skipped to the next track.")
             )
         else:
             await interaction.response.send_message(

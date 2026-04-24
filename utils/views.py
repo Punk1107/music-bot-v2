@@ -133,6 +133,11 @@ class MusicControlView(discord.ui.View):
                 await interaction.message.edit(view=self)
             except Exception:
                 pass
+        except discord.NotFound:
+            # Message was deleted — nothing to edit, ignore gracefully
+            pass
+        except Exception:
+            pass
 
     # ── Row 0: Core controls ──────────────────────────────────────────────────
 
@@ -178,10 +183,8 @@ class MusicControlView(discord.ui.View):
             player.progress_task = None
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
-        await interaction.response.send_message(
-            embed=success_embed("Skipped", "⏭ Skipped to the next track."),
-            ephemeral=True,
-        )
+        # Defer silently — the new Now Playing embed will appear via _play_next
+        await interaction.response.defer()
 
     @discord.ui.button(
         label="🔁 Loop Off",
@@ -211,10 +214,36 @@ class MusicControlView(discord.ui.View):
             return
         player = self.bot.get_player(self.guild_id)
         await player.shuffle()
-        await interaction.response.send_message(
-            embed=success_embed("Shuffled", "🔀 Queue has been shuffled."),
-            ephemeral=True,
-        )
+        # Edit the Now Playing message in-place with a shuffle confirmation header
+        self._sync_buttons()
+        guild = self.bot.get_guild(self.guild_id)
+        requester_member: Optional[discord.Member] = None
+        if player.now_playing and player.now_playing.requester_id and guild:
+            requester_member = guild.get_member(player.now_playing.requester_id)
+        if player.now_playing:
+            embed = now_playing_embed(
+                player.now_playing,
+                elapsed      = player.elapsed_seconds(),
+                requester    = requester_member,
+                loop_label   = player.loop_mode.label(),
+                loop_short   = player.loop_mode.short_label(),
+                effects      = [e.display_name for e in player.effects],
+                volume       = player.volume,
+                quality      = player.quality,
+                queue_count  = len(player),
+                queue_dur    = player.queue_duration(),
+                channel_name = player.now_playing.uploader or "",
+                accent_color = player.accent_color,
+            )
+            # Prepend a shuffle notice to the description
+            original_desc = embed.description or ""
+            embed.description = f"🔀 **Queue shuffled!**\n{original_desc}"
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                await interaction.response.defer()
+        else:
+            await interaction.response.defer()
 
     @discord.ui.button(
         label="⏹ Stop",
@@ -237,10 +266,24 @@ class MusicControlView(discord.ui.View):
         if vc:
             vc.stop()
             await vc.disconnect()
-        await interaction.response.send_message(
-            embed=success_embed("Stopped", "⏹ Playback stopped and disconnected."),
-            ephemeral=True,
+        # Disable all buttons and edit the Now Playing message in-place
+        for child in self.children:
+            child.disabled = True
+        stop_embed = discord.Embed(
+            title       = "⏹ Playback Stopped",
+            description = "The queue has been cleared and the bot has disconnected.",
+            colour      = 0xED4245,
         )
+        try:
+            await interaction.response.edit_message(embed=stop_embed, view=self)
+        except Exception:
+            # Fallback: send a public message if edit fails
+            try:
+                await interaction.response.send_message(
+                    embed=success_embed("Stopped", "⏹ Playback stopped and disconnected.")
+                )
+            except Exception:
+                pass
         self.stop()
 
     # ── Row 1: Volume controls ────────────────────────────────────────────────
