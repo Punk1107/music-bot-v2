@@ -51,7 +51,6 @@ class InfoCog(commands.Cog, name="Info"):
         if not player.now_playing:
             await interaction.response.send_message(
                 embed=info_embed("Nothing Playing", "No track is currently playing."),
-                ephemeral=True,
             )
             return
 
@@ -76,7 +75,7 @@ class InfoCog(commands.Cog, name="Info"):
 
     @app_commands.command(name="help", description="Show all available commands.")
     async def help(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=help_embed(), ephemeral=True)
+        await interaction.response.send_message(embed=help_embed())
 
     @app_commands.command(name="stats", description="Show bot performance statistics.")
     async def stats(self, interaction: discord.Interaction) -> None:
