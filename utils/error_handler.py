@@ -201,14 +201,14 @@ async def notify_playback_error(
     track: Optional["Track"] = None,
     *,
     skipping: bool = True,
-    delete_after: Optional[float] = 15.0,
 ) -> None:
     """
     Send a playback error embed to *channel*.
+    Messages persist permanently — no auto-delete.
     Silently fails if the channel is unavailable.
     """
     try:
         embed = playback_error_embed(exc, track, skipping=skipping)
-        await channel.send(embed=embed, delete_after=delete_after)
+        await channel.send(embed=embed)
     except Exception as send_exc:
         logger.debug("Could not send error notification: %s", send_exc)

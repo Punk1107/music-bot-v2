@@ -136,7 +136,6 @@ class MusicCog(commands.Cog, name="Music"):
                     embed=voice_connection_error_embed(
                         channel.name, config.RECONNECT_ATTEMPTS
                     ),
-                    delete_after=30.0,
                 )
             except Exception:
                 pass
@@ -201,7 +200,6 @@ class MusicCog(commands.Cog, name="Music"):
                 if player.text_channel:
                     await notify_playback_error(
                         player.text_channel, exc, next_track, skipping=False,
-                        delete_after=20.0,
                     )
                 return
             # Notify user and skip to next track
@@ -772,7 +770,11 @@ class MusicCog(commands.Cog, name="Music"):
         player.reset()
         if vc:
             vc.stop()
-        await self.bot.db.clear_queue(interaction.guild_id)
+        try:
+            await self.bot.db.clear_queue(interaction.guild_id)
+        except Exception as exc:
+            logger.warning("Failed to clear DB queue for guild %d during stop: %s",
+                           interaction.guild_id, exc)
         await interaction.response.send_message(
             embed=success_embed("Stopped", "⏹ Playback stopped and queue cleared.")
         )

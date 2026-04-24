@@ -311,7 +311,7 @@ class MusicBot(commands.Bot):
                                  "*(พิมพ์ /play เมื่อพร้อมฟังอีกครั้งนะครับ)*"
                         )
                         await player.text_channel.send(
-                            embed=farewell_embed, delete_after=15.0
+                            embed=farewell_embed
                         )
                     except Exception:
                         pass

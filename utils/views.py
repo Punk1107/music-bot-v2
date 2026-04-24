@@ -391,17 +391,18 @@ class SearchSelectView(discord.ui.View):
         self.stop()
 
 
-# ── Queue pagination ──────────────────────────────────────────────────────────
+# ── Queue pagination + interactive management ─────────────────────────────────
 
 class QueueView(discord.ui.View):
     """
-    Paginated queue display with ◀ / ▶ navigation buttons.
+    Paginated queue display with navigation buttons and an interactive
+    Select dropdown for per-track management.
 
-    Changes (V2.1):
-    - _build_embed() renamed to build_embed() — public API
-    - Buttons are disabled when on first / last page
-    - Refresh button to re-read the live queue
-    - Page indicator in button labels
+    Row 0: ◀ Prev | 📄 Page | Next ▶ | 🔄 Refresh
+    Row 1: ⚡ Track select dropdown (up to 25 options from current page)
+    Row 2 (after track selection): 🗑️ Remove | ⬆️ Move to Top | ✖ Cancel
+
+    After any action the embed and dropdown auto-refresh in-place.
     """
 
     PER_PAGE = 10
@@ -415,11 +416,16 @@ class QueueView(discord.ui.View):
         timeout: float = 120.0,
     ) -> None:
         super().__init__(timeout=timeout)
-        self.bot        = bot
-        self.guild_id   = guild_id
-        self.guild_name = guild_name
-        self.page       = 1
+        self.bot              = bot
+        self.guild_id         = guild_id
+        self.guild_name       = guild_name
+        self.page             = 1
+        self._selected_idx:   Optional[int] = None   # 0-based global queue index
+        self._selected_label: str = ""
         self._update_buttons()
+        self._rebuild_select()
+
+    # ── Embed builder ──────────────────────────────────────────────────────────
 
     def build_embed(self) -> discord.Embed:
         """Build and return the queue embed for the current page (public)."""
@@ -434,8 +440,10 @@ class QueueView(discord.ui.View):
             total_duration = player.queue_duration(),
         )
 
-    # Keep the private alias for any internal legacy calls
+    # Private alias kept for backward compat
     _build_embed = build_embed
+
+    # ── Page helpers ──────────────────────────────────────────────────────────
 
     def _max_pages(self) -> int:
         player = self.bot.get_player(self.guild_id)
@@ -456,34 +464,226 @@ class QueueView(discord.ui.View):
                 elif child.custom_id == "queue_page_indicator":
                     child.label    = f"📄 {self.page}/{max_pages}"
 
-    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="queue_prev")
+    # ── Select dropdown ───────────────────────────────────────────────────────
+
+    def _rebuild_select(self) -> None:
+        """
+        Remove any existing dropdown / action buttons, then add a fresh
+        Select populated with the tracks on the current page.
+        Action buttons appear only after a track is chosen.
+        """
+        removable_ids = {
+            "queue_track_select",
+            "queue_action_remove",
+            "queue_action_top",
+            "queue_action_cancel",
+        }
+        for item in list(self.children):
+            if getattr(item, "custom_id", None) in removable_ids:
+                self.remove_item(item)
+
+        player = self.bot.get_player(self.guild_id)
+        tracks = player.as_list()
+        start  = (self.page - 1) * self.PER_PAGE
+        chunk  = tracks[start: start + self.PER_PAGE]
+
+        if not chunk:
+            return   # Queue empty — skip adding the dropdown
+
+        from utils.formatters import fmt_duration as _fmt
+        options = []
+        for local_i, t in enumerate(chunk[:25]):   # Discord caps Select at 25
+            global_idx = start + local_i
+            label      = f"#{global_idx + 1}  {t.title}"
+            if len(label) > 100:
+                label = label[:97] + "…"
+            options.append(
+                discord.SelectOption(
+                    label       = label,
+                    description = _fmt(t.duration),
+                    value       = str(global_idx),
+                    emoji       = "🎵",
+                )
+            )
+
+        select = discord.ui.Select(
+            placeholder = "⚡ Select a track to manage…",
+            options     = options,
+            custom_id   = "queue_track_select",
+            row         = 1,
+        )
+        select.callback = self._on_track_select
+        self.add_item(select)
+
+    async def _on_track_select(self, interaction: discord.Interaction) -> None:
+        """User picked a track — store index and reveal action buttons."""
+        self._selected_idx   = int(interaction.data["values"][0])
+        player               = self.bot.get_player(self.guild_id)
+        tracks               = player.as_list()
+        if self._selected_idx < len(tracks):
+            self._selected_label = tracks[self._selected_idx].title[:50]
+        else:
+            self._selected_label = f"Track #{self._selected_idx + 1}"
+
+        # Strip any stale action buttons first
+        for item in list(self.children):
+            if getattr(item, "custom_id", None) in {
+                "queue_action_remove", "queue_action_top", "queue_action_cancel"
+            }:
+                self.remove_item(item)
+
+        btn_remove = discord.ui.Button(
+            label="🗑️ Remove", style=discord.ButtonStyle.danger,
+            custom_id="queue_action_remove", row=2,
+        )
+        btn_top = discord.ui.Button(
+            label="⬆️ Move to Top", style=discord.ButtonStyle.success,
+            custom_id="queue_action_top", row=2,
+        )
+        btn_cancel = discord.ui.Button(
+            label="✖ Cancel", style=discord.ButtonStyle.secondary,
+            custom_id="queue_action_cancel", row=2,
+        )
+        btn_remove.callback = self._on_action_remove
+        btn_top.callback    = self._on_action_top
+        btn_cancel.callback = self._on_action_cancel
+        self.add_item(btn_remove)
+        self.add_item(btn_top)
+        self.add_item(btn_cancel)
+
+        confirm_embed = discord.Embed(
+            description=(
+                f"> 🎵 **{self._selected_label}**\n"
+                "Choose an action below:"
+            ),
+            colour=0x5865F2,
+        )
+        await interaction.response.edit_message(embed=confirm_embed, view=self)
+
+    async def _on_action_remove(self, interaction: discord.Interaction) -> None:
+        """Remove the selected track then refresh the queue display."""
+        if self._selected_idx is None:
+            await interaction.response.defer()
+            return
+        player  = self.bot.get_player(self.guild_id)
+        removed = await player.remove(self._selected_idx)
+        self._selected_idx = None
+
+        self.page = min(self.page, self._max_pages())   # clamp after removal
+        self._update_buttons()
+        self._rebuild_select()
+
+        if removed:
+            result_embed = discord.Embed(
+                description=f"🗑️ Removed **{removed.title[:60]}** from the queue.",
+                colour=0xED4245,
+            )
+            await interaction.response.edit_message(embed=result_embed, view=self)
+            await asyncio.sleep(1.5)
+            try:
+                await interaction.edit_original_response(
+                    embed=self.build_embed(), view=self
+                )
+            except Exception:
+                pass
+        else:
+            await interaction.response.edit_message(
+                embed=error_embed("Remove Failed", "That track is no longer in the queue."),
+                view=self,
+            )
+
+    async def _on_action_top(self, interaction: discord.Interaction) -> None:
+        """Move the selected track to position 0 (front of queue) then refresh."""
+        if self._selected_idx is None:
+            await interaction.response.defer()
+            return
+        player = self.bot.get_player(self.guild_id)
+        moved  = await player.move(self._selected_idx, 0)
+        self._selected_idx = None
+
+        self.page = 1   # Jump to page 1 so user sees the moved track immediately
+        self._update_buttons()
+        self._rebuild_select()
+
+        if moved:
+            result_embed = discord.Embed(
+                description=f"⬆️ Moved **{moved.title[:60]}** to the top of the queue!",
+                colour=0x2ECC71,
+            )
+            await interaction.response.edit_message(embed=result_embed, view=self)
+            await asyncio.sleep(1.5)
+            try:
+                await interaction.edit_original_response(
+                    embed=self.build_embed(), view=self
+                )
+            except Exception:
+                pass
+        else:
+            await interaction.response.edit_message(
+                embed=error_embed("Move Failed", "Could not move that track."),
+                view=self,
+            )
+
+    async def _on_action_cancel(self, interaction: discord.Interaction) -> None:
+        """Cancel selection — dismiss action buttons and restore queue view."""
+        self._selected_idx = None
+        for item in list(self.children):
+            if getattr(item, "custom_id", None) in {
+                "queue_action_remove", "queue_action_top", "queue_action_cancel"
+            }:
+                self.remove_item(item)
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    # ── Row 0: Navigation buttons ─────────────────────────────────────────────
+
+    @discord.ui.button(
+        label="◀ Prev", style=discord.ButtonStyle.secondary,
+        custom_id="queue_prev", row=0,
+    )
     async def prev_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if self.page > 1:
             self.page -= 1
+        self._selected_idx = None
         self._update_buttons()
+        self._rebuild_select()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="📄 1/1", style=discord.ButtonStyle.secondary, custom_id="queue_page_indicator", disabled=True)
+    @discord.ui.button(
+        label="📄 1/1", style=discord.ButtonStyle.secondary,
+        custom_id="queue_page_indicator", disabled=True, row=0,
+    )
     async def page_indicator(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         await interaction.response.defer()
 
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="queue_next")
+    @discord.ui.button(
+        label="Next ▶", style=discord.ButtonStyle.secondary,
+        custom_id="queue_next", row=0,
+    )
     async def next_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if self.page < self._max_pages():
             self.page += 1
+        self._selected_idx = None
         self._update_buttons()
+        self._rebuild_select()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.primary, custom_id="queue_refresh")
+    @discord.ui.button(
+        label="🔄 Refresh", style=discord.ButtonStyle.primary,
+        custom_id="queue_refresh", row=0,
+    )
     async def refresh(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        """Re-read the live queue and update the embed."""
+        """Re-read the live queue and refresh the embed + dropdown."""
+        self._selected_idx = None
         self._update_buttons()
+        self._rebuild_select()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
