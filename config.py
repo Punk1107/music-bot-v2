@@ -29,6 +29,31 @@ SPOTIFY_CLIENT_SECRET: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 # ── Database ──────────────────────────────────────────────────────────────────
 DATABASE_PATH: str = os.getenv("DATABASE_PATH", "data/musicbot.db")
 
+# ── Audio backend (P3-1: Lavalink prep) ───────────────────────────────────────
+AUDIO_BACKEND: str = os.getenv("AUDIO_BACKEND", "ffmpeg")  # "ffmpeg" | "lavalink"
+
+# ── Developer channel (P2-5: Global exception interceptor) ────────────────────
+DEV_LOG_CHANNEL_ID: int | None = (
+    int(os.getenv("DEV_LOG_CHANNEL_ID")) if os.getenv("DEV_LOG_CHANNEL_ID") else None
+)
+
+# ── Auto-resume on startup (P2-3: State recovery) ─────────────────────────────
+AUTO_RESUME: bool = os.getenv("AUTO_RESUME", "false").lower() == "true"
+
+# ── AI NLU (P4-1) ────────────────────────────────────────────────────────────
+NLU_ENABLED: bool = os.getenv("NLU_ENABLED", "false").lower() == "true"
+
+# ── Circuit Breaker (P2-2) ────────────────────────────────────────────────────
+CIRCUIT_BREAKER_THRESHOLD: int   = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "5"))
+CIRCUIT_BREAKER_WINDOW:    float = float(os.getenv("CIRCUIT_BREAKER_WINDOW",   "60"))
+
+# ── Predictive pre-fetch (P3-2) ───────────────────────────────────────────────
+PREFETCH_BEFORE_END:  int   = int(os.getenv("PREFETCH_BEFORE_END",  "15"))   # seconds
+STREAM_URL_TTL:       float = float(os.getenv("STREAM_URL_TTL",      "14400"))  # 4 hours
+
+# ── Extraction concurrency throttle (P3-5) ────────────────────────────────────
+EXTRACT_CONCURRENCY: int = int(os.getenv("EXTRACT_CONCURRENCY", "3"))
+
 # ── Bot limits ────────────────────────────────────────────────────────────────
 MAX_QUEUE_SIZE: int      = int(os.getenv("MAX_QUEUE_SIZE",    "100"))
 MAX_USER_QUEUE: int      = int(os.getenv("MAX_USER_QUEUE",    "15"))
