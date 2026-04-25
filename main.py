@@ -117,6 +117,7 @@ class MusicBot(commands.Bot):
         self._config_cache: dict[int, ServerConfig] = {}
 
         self._shutdown = False
+        self.start_time = discord.utils.utcnow()
 
     # ── Player registry ───────────────────────────────────────────────────────
 
@@ -169,6 +170,13 @@ class MusicBot(commands.Bot):
         # Start background tasks
         self._idle_checker.start()
         self._queue_saver.start()
+
+        # Start Webserver natively using bot's event loop
+        if _WEBSERVER_AVAILABLE:
+            try:
+                self.web_runner = await webserver.start_webserver(self)
+            except Exception as exc:
+                logger.error("Failed to start webserver: %s", exc, exc_info=True)
 
     async def on_ready(self) -> None:
         logger.info(
@@ -268,6 +276,14 @@ class MusicBot(commands.Bot):
                     )
             except Exception as exc:
                 logger.warning("Failed to persist queue for guild %d: %s", guild_id, exc)
+
+        # Close Webserver
+        if hasattr(self, "web_runner") and self.web_runner:
+            try:
+                await self.web_runner.cleanup()
+                logger.info("Webserver stopped cleanly.")
+            except Exception as exc:
+                logger.warning("Webserver shutdown error: %s", exc)
 
         # Close shared HTTP session
         if self.http_session and not self.http_session.closed:
@@ -457,10 +473,6 @@ class MusicBot(commands.Bot):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    # Optional: start keep-alive webserver (for Render / UptimeRobot)
-    if _WEBSERVER_AVAILABLE:
-        webserver.start()
-
     bot = MusicBot()
 
     # Graceful SIGINT / SIGTERM handling
