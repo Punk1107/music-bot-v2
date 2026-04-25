@@ -1,4 +1,4 @@
-# 🎵 Music Bot V2
+# 🎵 Music Bot V3 (Enterprise Edition)
 
 A professional, production-ready Discord music bot built in Python. Refactored from the ground up with a clean modular architecture, a rich dashboard-style UI, and enterprise-grade stability patterns.
 
@@ -8,35 +8,35 @@ A professional, production-ready Discord music bot built in Python. Refactored f
 
 | Feature | Details |
 |---------|---------|
-| 🎵 YouTube Playback | URL or search keywords; smart autocomplete from guild history |
-| 🎤 Spotify Support | Track, album, full playlist → parallel-resolved to YouTube |
-| 📋 Smart Queue | Persistent to SQLite, paginated & interactive dropdown management |
-| 🔁 Loop Modes | Off → Track → Queue (cycles via button or command) |
-| 🎛 18 Audio Effects | Bass Boost, Nightcore, Vaporwave, Treble Boost, Vocal Boost, Karaoke, Vibrato, Tremolo, Chorus, Reverb, Echo, Distortion, Mono, Stereo Enhance, Compressor, Limiter, Noise Gate, 8D Audio |
-| 🔊 Volume Control | 0–200% via `/volume` command or ±10% live buttons on Now Playing |
-| 🎮 Interactive UI | Now Playing buttons, Queue dropdown, Search select — all edit-in-place |
-| 🎨 Dynamic Accent Colors | Dominant color auto-extracted from each track's thumbnail (zero dependencies — pure Python PNG/JPEG decoder) |
-| 📊 Statistics | Per-guild play history, per-user stats, live bot performance metrics |
-| 🛡 Multi-layer Content Filter | Pattern + domain + TLD + Content-Type checks; blocks NSFW, gambling, piracy; supports Thai keywords |
-| 💤 Idle Auto-disconnect | Configurable timeout; sends bilingual (EN/TH) farewell message |
-| 🔄 Self-healing Voice | Exponential-backoff reconnect (2s → 4s → 8s, up to 3 attempts) |
-| 🔁 Auto-skip on Error | Up to 5 broken tracks skipped automatically before stopping |
-| 🔍 Search History Autocomplete | `/play` autocomplete powered by per-guild SQLite search history |
-| 📝 Structured Logging | Coloured console + rotating full log + error-only log |
-| 🌐 Bilingual Error Messages | All error embeds include English + Thai subtitles |
-| 💾 Queue Persistence | Queues auto-saved every 5 minutes and on graceful shutdown |
-| 🌐 Keep-alive Webserver | Optional Flask server for Render / Railway / UptimeRobot hosting |
+| 🎵 **YouTube Playback** | URL or search keywords; smart autocomplete from guild search history. |
+| 🎤 **Spotify Support** | Track, album, full playlist → parallel-resolved to YouTube via `asyncio.Semaphore` (up to 5 concurrently). |
+| 📋 **Smart Queue** | Persistent to SQLite, paginated & interactive dropdown management. |
+| 🔁 **Loop Modes** | Cycle between `Off`, `Track`, and `Queue` via button or command. |
+| 🎛 **18 Audio Effects** | Bass Boost, Nightcore, Vaporwave, Treble Boost, Vocal Boost, Karaoke, Vibrato, Tremolo, Chorus, Reverb, Echo, Distortion, Mono, Stereo Enhance, Compressor, Limiter, Noise Gate, 8D Audio. |
+| 🔊 **Volume Control** | 0–200% via `/volume` command or ±10% live buttons on Now Playing. |
+| 🎮 **Interactive UI** | Now Playing buttons (dynamic skip counts, disabled states), Queue dropdown, Search select — edit-in-place without chat spam. |
+| 🎨 **Dynamic Accent Colors** | Dominant color auto-extracted from each track's thumbnail (zero dependencies — pure Python PNG/JPEG decoder). |
+| 📊 **Statistics** | Per-guild play history, per-user stats, live bot performance metrics. |
+| 🛡 **Content Filter** | 8-stage pipeline (Patterns, Domains, TLDs, Provider Whitelist, Async Content-Type Sniffing, etc.); blocks NSFW, gambling, piracy. |
+| 💤 **Idle Auto-disconnect** | Configurable timeout; sends bilingual (EN/TH) farewell message. |
+| 🔄 **Self-healing Voice** | Exponential-backoff reconnect (2s → 4s → 8s, up to 3 attempts) for unexpected drops. |
+| ⏩ **Auto-skip on Error** | Up to 5 broken tracks skipped automatically before stopping. |
+| 🔍 **Search Autocomplete** | `/play` autocomplete powered by per-guild SQLite search history. |
+| 📝 **Structured Logging** | Coloured console + rotating full log + error-only log. |
+| 🌐 **Bilingual Errors** | Comprehensive classification (Copyright, Age-Restricted, Rate Limits, etc.) with English + Thai subtitles. |
+| 💾 **Queue Persistence** | Queues auto-saved every 5 minutes and on graceful shutdown. |
+| 🌐 **Keep-alive Webserver**| Optional Flask server for Render / Railway / UptimeRobot hosting. |
 
 ---
 
 ## 📁 Project Structure
 
-```
-Music Bot V2/
+```text
+Music Bot V3/
 ├── main.py                  # MusicBot class, event handlers, background tasks
 ├── config.py                # All settings loaded from .env + logging setup
 ├── webserver.py             # Optional Flask keep-alive server (port 8080)
-├── requirements.txt
+├── requirements.txt         # Production dependencies
 ├── .env                     # Your secrets (not committed)
 │
 ├── cogs/                    # Discord slash-command groups
@@ -51,18 +51,24 @@ Music Bot V2/
 │   ├── spotify.py           # Spotify → YouTube query converter (graceful no-op if unavailable)
 │   ├── audio.py             # FFmpeg filter-chain builder for effects + quality + volume
 │   ├── player.py            # GuildPlayer — all queue ops locked with asyncio.Lock
-│   └── validator.py         # 4-stage URL safety pipeline + search-text sanitisation
+│   └── validator.py         # 8-stage URL safety pipeline + search-text sanitisation
 │
 ├── models/                  # Plain data types
 │   ├── track.py             # Track dataclass with JSON serialisation
 │   ├── server_config.py     # Per-guild settings dataclass with JSON serialisation
 │   └── enums.py             # LoopMode, AudioEffect (18 effects), AudioQuality (4 levels)
 │
+├── tests/                   # Test suite
+│   ├── test_circuit_breaker.py
+│   ├── test_embeds.py
+│   ├── test_player.py
+│   └── test_validator.py
+│
 └── utils/                   # Pure helpers
-    ├── embeds.py            # All Discord embed factories (Now Playing, Queue, Search, Help…)
-    ├── views.py             # MusicControlView, QueueView, SearchSelectView
+    ├── embeds.py            # Discord embed factories (Dashboard UI, dynamic colors)
+    ├── views.py             # Interactive UIs: MusicControlView, QueueView, SearchSelectView
     ├── color_thief.py       # Async dominant-color extractor (no Pillow); TTL cache + stampede guard
-    ├── formatters.py        # fmt_duration, progress_bar, fmt_views, truncate, ordinal
+    ├── formatters.py        # String and time formatting helpers
     ├── rate_limiter.py      # Sliding-window per-(guild, user) rate limiter
     └── error_handler.py     # Bilingual error classification, playback/command error embeds
 ```
@@ -102,6 +108,7 @@ Slash commands are synced globally on every startup. The database file is create
 3. Enable the following **Privileged Gateway Intents**:
    - **Server Members Intent**
    - **Message Content Intent**
+   - **Voice State Intent**
 4. Under **OAuth2 → URL Generator**, select:
    - Scopes: `bot`, `applications.commands`
    - Bot permissions: `Connect`, `Speak`, `Send Messages`, `Embed Links`, `Use Slash Commands`, `View Channels`
@@ -158,58 +165,40 @@ Every new track sends a rich embed with:
 
 | Field | Content |
 |-------|---------|
-| Title | Hyperlinked track title + channel name |
-| Thumbnail | Track artwork (right-side thumbnail) |
-| Row 1 | ⏱ Duration · 👁 View count · 📋 Queue size + remaining time |
-| Row 2 | 👤 Requested by · 🔁 Loop badge · 🎚 Audio quality |
-| Row 3 | 🔊 Volume bar (`▮▮▮▮▮▯▯▯▯▯ 75%`) + active effects list |
-| Progress | `▓▓▓▓▓░░░░░░░░░░░░░░░  1:23 / 3:45` (auto-updates every 7 s) |
-| Accent color | Extracted live from the track thumbnail (vibrant pixel algorithm) |
+| **Title** | Hyperlinked track title + channel name |
+| **Thumbnail** | Track artwork (right-side thumbnail) |
+| **Row 1** | ⏱ Duration · 👁 View count · 📋 Queue size + remaining time |
+| **Row 2** | 👤 Requested by · 🔁 Loop badge · 🎚 Audio quality |
+| **Row 3** | 🔊 Volume bar (`▮▮▮▮▮▯▯▯▯▯ 75%`) + active effects list |
+| **Progress** | `▓▓▓▓▓░░░░░░░░░░░░░░░  1:23 / 3:45` (auto-updates every 7 s) |
+| **Accent Color** | Extracted live from the track thumbnail (vibrant pixel algorithm) |
 
 ### Playback Control Buttons
 Attached to every Now Playing message — all edits happen in-place, no extra messages:
 
 **Row 0 — Core Controls**
-
-| Button | Behaviour |
-|--------|-----------|
-| ⏸ Pause / ▶ Resume | Toggles; button label and style update live |
-| ⏭ Skip (N) | Skips track; badge shows how many remain in queue |
-| 🔁 / 🔂 Loop | Cycles Off → Track → Queue; button turns green when active |
-| 🔀 Shuffle | Shuffles queue and refreshes the Now Playing embed in-place |
-| ⏹ Stop | Stops playback, clears queue, disconnects, disables all buttons |
+- ⏸ **Pause** / ▶ **Resume**: Toggles; button label and style update live
+- ⏭ **Skip**: Skips track; badge shows live queue count, e.g., `Skip (3)`
+- 🔁 **Loop**: Cycles Off → Track → Queue; button turns green when active
+- 🔀 **Shuffle**: Shuffles queue and refreshes the embed in-place
+- ⏹ **Stop**: Stops playback, clears queue, disconnects, disables all buttons
 
 **Row 1 — Volume**
-
-| Button | Behaviour |
-|--------|-----------|
-| 🔉 Vol -10% | Lowers volume by 10%; rebuilds Now Playing embed in-place |
-| 🔊 Vol +10% | Raises volume by 10%; rebuilds Now Playing embed in-place |
-
-> Both Skip (disabled when nothing is playing) and Shuffle (disabled with < 2 tracks) are dynamically enabled/disabled based on real-time player state.
+- 🔉 **Vol -10%**: Lowers volume by 10%; rebuilds Now Playing embed in-place
+- 🔊 **Vol +10%**: Raises volume by 10%; rebuilds Now Playing embed in-place
 
 ### Interactive Queue View (`/queue`)
 A single message with live navigation and track management:
 
 **Row 0 — Navigation**
-
-| Button | Action |
-|--------|--------|
-| ◀ Prev | Go to previous page |
-| 📄 N/M | Page indicator (disabled — display only) |
-| Next ▶ | Go to next page |
-| 🔄 Refresh | Re-read the live queue without re-sending |
+- ◀ **Prev**: Go to previous page
+- 📄 **N/M**: Page indicator (disabled — display only)
+- **Next** ▶: Go to next page
+- 🔄 **Refresh**: Re-read the live queue without re-sending
 
 **Row 1 — Track Select Dropdown**
-
 - Dropdown lists up to 10 tracks on the current page
-- Selecting a track reveals three action buttons (Row 2):
-
-| Button | Action |
-|--------|--------|
-| 🗑️ Remove | Remove the track; queue refreshes automatically |
-| ⬆️ Move to Top | Move to position #1; view jumps to page 1 |
-| ✖ Cancel | Dismiss without action |
+- Selecting a track reveals action buttons: 🗑️ **Remove**, ⬆️ **Move to Top**, ✖ **Cancel**
 
 ### Search Results (`/search`)
 - Sends a numbered embed with up to 10 results
@@ -255,17 +244,16 @@ A single message with live navigation and track management:
    SPOTIFY_CLIENT_SECRET=your_secret
    ```
 3. Uncomment `spotipy>=2.23.0` in `requirements.txt` and run `pip install spotipy`
-4. Supports: single tracks, albums, and full paginated playlists
-5. Resolves up to **5 tracks in parallel** via `asyncio.Semaphore`
+4. Resolves single tracks, albums, and full paginated playlists up to **5 tracks in parallel**.
 
 ### Keep-alive Webserver
 For hosting platforms that require an active HTTP endpoint (Render, Railway, UptimeRobot):
 1. Uncomment `flask>=3.0.0` in `requirements.txt` and run `pip install flask`
 2. Exposes `GET /` and `GET /health` on `PORT` (default `8080`)
-3. Runs in a background daemon thread — zero impact on bot performance
+3. Runs in a background daemon thread — zero impact on bot performance.
 
-### Cookies (Age-restricted / Sign-in Required Videos)
-Place a `cookies.txt` file (Netscape format, exported from your browser) in the project root. yt-dlp automatically picks it up for all operations.
+### Cookies (Age-restricted Videos)
+Place a `cookies.txt` file (Netscape format) in the project root. `yt-dlp` automatically picks it up to bypass age restrictions.
 
 ---
 
@@ -273,85 +261,60 @@ Place a `cookies.txt` file (Netscape format, exported from your browser) in the 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DISCORD_TOKEN` | — | **Required.** Bot token from Discord Developer Portal |
-| `APP_ID` | — | Application ID for slash command registration |
-| `SPOTIFY_CLIENT_ID` | — | Spotify API client ID (optional) |
-| `SPOTIFY_CLIENT_SECRET` | — | Spotify API client secret (optional) |
+| `DISCORD_TOKEN` | — | **Required.** Bot token from Discord |
+| `APP_ID` | — | Application ID for slash commands |
+| `SPOTIFY_CLIENT_ID` | — | Spotify API client ID |
+| `SPOTIFY_CLIENT_SECRET` | — | Spotify API client secret |
 | `DATABASE_PATH` | `data/musicbot.db` | Path to the SQLite database file |
 | `MAX_QUEUE_SIZE` | `100` | Maximum tracks allowed per guild queue |
-| `MAX_USER_QUEUE` | `15` | Maximum tracks a single user can have in the queue |
+| `MAX_USER_QUEUE` | `15` | Maximum tracks a single user can enqueue |
 | `MAX_TRACK_LENGTH` | `10800` | Maximum track length in seconds (default 3 h) |
-| `IDLE_TIMEOUT` | `300` | Seconds of inactivity before auto-disconnect (5 min) |
+| `IDLE_TIMEOUT` | `300` | Seconds of inactivity before auto-disconnect |
 | `HISTORY_DAYS` | `30` | Days of play history retained per guild |
 | `EXTRA_BANNED_DOMAINS` | — | Comma-separated extra domains to block |
 | `PORT` | `8080` | Keep-alive webserver port |
 
 ---
 
-## 🗄 Database Schema
-
-The SQLite database (`data/musicbot.db`) uses **WAL mode** for concurrent read performance. Tables:
-
-| Table | Purpose |
-|-------|---------|
-| `queue` | Persisted queue tracks per guild (position-ordered) |
-| `history` | Play history with skip/complete status and duration played |
-| `server_configs` | Per-guild configuration JSON (upserted on save) |
-| `user_stats` | Per-(user, guild) track count and total listening time |
-| `search_history` | Recent search queries per guild powering `/play` autocomplete (max 200/guild) |
-
----
-
 ## 🏗 Architecture & Design Notes
 
 ### Async-first Throughout
-All I/O is non-blocking: `aiosqlite` for the database, `aiohttp` for thumbnail fetching and content-type sniffing, `asyncio.run_in_executor` for yt-dlp's blocking calls. No `time.sleep` or blocking file I/O anywhere in the hot path.
+All I/O is non-blocking: `aiosqlite` for the database, `aiohttp` for thumbnail fetching and content-type sniffing, `asyncio.run_in_executor` for `yt-dlp`'s blocking calls. No `time.sleep` or blocking file I/O anywhere in the hot path.
 
 ### Persistent Database Connection
-A single `aiosqlite` connection is opened at startup and held for the bot's lifetime. All access is serialised through an `asyncio.Lock` — eliminates the per-query open/close overhead.
+A single `aiosqlite` connection is opened at startup and held for the bot's lifetime. All access is serialised through an `asyncio.Lock`, eliminating the per-call open/close overhead that caused O(N) connection churn. We combine history logging and user stats updates into a single transaction per track. Uses **WAL mode** for concurrent read performance.
 
-### GuildPlayer — Lock-protected State
-Every queue mutation (`enqueue`, `dequeue`, `remove`, `shuffle`, `move`, `clear`) acquires `GuildPlayer.queue_lock`. This prevents race conditions when multiple users press control buttons simultaneously.
+### Lock-protected GuildPlayer
+Every queue mutation (`enqueue`, `dequeue`, `remove`, `shuffle`, `move`, `clear`) acquires `GuildPlayer.queue_lock` asynchronously. This prevents race conditions when multiple users press control buttons simultaneously.
 
-### Two-tier yt-dlp Cache
-- **URL metadata cache**: raw yt-dlp dict, TTL 300 s, max 50 entries
-- **Search result cache**: fully parsed `Track` list, TTL 300 s, max 100 entries — cache hits return instantly with no re-parsing
+### Circuit Breakers & Two-tier yt-dlp Cache
+- **Exponential Backoff**: `yt-dlp` calls use true exponential backoff (e.g. 1s, 2s, 4s) to survive transient network issues.
+- **URL metadata cache**: raw yt-dlp dict, TTL 300 s, max 50 entries.
+- **Search result cache**: fully parsed `Track` list, TTL 300 s, max 100 entries — cache hits return instantly with zero re-parsing.
 
-### Dynamic Accent Colors (Zero Dependencies)
-`utils/color_thief.py` fetches the track thumbnail via the shared `aiohttp.ClientSession`, decodes PNG (IHDR + IDAT chunks) or JPEG (scan-segment sampling) entirely in pure Python, picks the most vibrant pixel (highest saturation × value in HSV space), and caches the result for 1 hour per URL. Concurrent requests for the same URL are collapsed into one fetch via an `asyncio.Event` stampede guard.
+### Dynamic Accent Colors
+`utils/color_thief.py` fetches the thumbnail, decodes PNG or JPEG entirely in **pure Python**, picks the most vibrant pixel, and caches the result for 1 hour per URL. Concurrent requests are collapsed via an `asyncio.Event` stampede guard.
 
 ### Self-healing Voice Reconnect
-When `_play_next` detects a missing voice client, it calls `_try_reconnect()` which retries up to `RECONNECT_ATTEMPTS` times (default 3) with exponential backoff: 2 s → 4 s → 8 s. On total failure it sends a bilingual error embed to the text channel.
+When `_play_next` detects a missing voice client, it calls `_try_reconnect()` which retries up to 3 times with exponential backoff: 2s → 4s → 8s. On total failure, it sends a bilingual error embed to the text channel.
 
-### Auto-skip on Broken Tracks
-`_play_next` tracks a `skip_depth` counter. Consecutive broken tracks are auto-skipped up to `SKIP_ERROR_LIMIT` (default 5). Each skip sends a bilingual `notify_playback_error` embed classifying the failure (copyright, private, age-restricted, rate-limited, timeout, network, or unknown).
-
-### Progress Bar Background Task
-A per-guild `asyncio.Task` edits the Now Playing message every `PROGRESS_BAR_UPDATE_INTERVAL` seconds (default 7 s). It cancels itself on skip/stop and handles `discord.NotFound` gracefully (message deleted by user). The task is always cancelled before a new track starts to avoid stale updates.
-
-### Background Tasks in `main.py`
-| Task | Interval | Purpose |
-|------|----------|---------|
-| `_idle_checker` | Every 30 s | Auto-disconnect guilds idle ≥ `IDLE_TIMEOUT`; cancels progress task and deletes Now Playing message first |
-| `_queue_saver` | Every 5 min | Persist all non-empty in-memory queues to SQLite |
+### Background Tasks
+- **`_idle_checker` (30s)**: Disconnects idle guilds, cancels progress tasks, and deletes Now Playing messages.
+- **`_queue_saver` (5m)**: Persists all in-memory queues to SQLite.
+- **Progress Bar Task (7s)**: Live-updates the Now Playing message. Handles deletions gracefully.
 
 ### Content Filter Pipeline (`core/validator.py`)
-Incoming URLs pass through four stages in order:
-1. **Pattern check** — word-boundary regex for NSFW / gambling / piracy keywords (including Thai)
-2. **Provider whitelist** — allow YouTube and Spotify domains immediately
-3. **Audio extension** — allow direct audio file URLs (`.mp3`, `.flac`, `.opus`, etc.)
-4. **Content-Type sniff** — async HEAD request with 5 s timeout; result cached for 300 s
+An 8-stage pipeline ensuring URL safety:
+1. **Pattern check** — Regex for NSFW/gambling/piracy keywords (EN/TH).
+2. **Domain & TLD blacklists** — Blocks known bad domains and TLDs.
+3. **Extra banned domains** — Configurable via environment variables.
+4. **Provider whitelist** — Allows YouTube/Spotify domains immediately.
+5. **Audio extension** — Allows direct audio URLs (`.mp3`, `.flac`, etc.).
+6. **Content-Type sniff** — Async `HEAD` request (cached 300s).
+7. **Search query sanitisation**.
 
-### Rate Limiter
-Per-(guild, user) sliding-window limiter: max **20 requests per 60 seconds**. Configured in `config.py` constants (not env-vars) for simplicity.
-
-### Graceful Shutdown
-On `SIGINT` / `SIGTERM`, the bot:
-1. Sets `_shutdown = True` to stop new tasks being scheduled
-2. Persists all active queues to SQLite
-3. Closes the shared `aiohttp.ClientSession`
-4. Closes the persistent `aiosqlite` connection
-5. Calls `discord.py`'s `super().close()`
+### Bilingual Error Classification
+A robust `error_handler.py` system dynamically categorizes errors (e.g. Copyright, Age-Restricted, Rate Limited, Network) and provides beautiful, bilingual (English/Thai) embeds so users know exactly why a track failed.
 
 ---
 
