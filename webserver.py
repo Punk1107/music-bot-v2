@@ -225,12 +225,16 @@ async def handle_root(request: web.Request) -> web.Response:
     bot = request.app["bot"]
     stats = get_bot_stats(bot)
 
-    html = HTML_TEMPLATE.format(
-        uptime=stats["uptime"],
-        latency=stats["latency"],
-        guilds=stats["guilds"],
-        players=stats["players"],
-        timestamp=stats["timestamp"],
+    html = HTML_TEMPLATE.replace(
+        "{uptime}", str(stats["uptime"])
+    ).replace(
+        "{latency}", str(stats["latency"])
+    ).replace(
+        "{guilds}", str(stats["guilds"])
+    ).replace(
+        "{players}", str(stats["players"])
+    ).replace(
+        "{timestamp}", str(stats["timestamp"])
     )
     return web.Response(text=html, content_type="text/html")
 
