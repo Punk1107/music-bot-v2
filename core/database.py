@@ -95,6 +95,17 @@ CREATE INDEX IF NOT EXISTS idx_history_guild_user   ON history(guild_id, user_id
 CREATE INDEX IF NOT EXISTS idx_history_played_at    ON history(played_at);
 CREATE INDEX IF NOT EXISTS idx_user_stats_guild     ON user_stats(guild_id);
 CREATE INDEX IF NOT EXISTS idx_search_history_guild ON search_history(guild_id, used_at);
+
+CREATE TABLE IF NOT EXISTS analytics (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id   INTEGER NOT NULL,
+    event_type TEXT    NOT NULL,
+    payload    TEXT    DEFAULT '{}',
+    ts         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_guild_ts ON analytics(guild_id, ts);
+CREATE INDEX IF NOT EXISTS idx_analytics_event    ON analytics(event_type);
 """
 
 
@@ -436,3 +447,121 @@ class DatabaseManager:
                 )
             rows = await cursor.fetchall()
         return [row["query"] for row in rows]
+
+    # ── P4-2: Anonymised Analytics ────────────────────────────────────────────
+
+    async def log_event(
+        self,
+        guild_id:   int,
+        event_type: str,
+        payload:    dict | None = None,
+    ) -> None:
+        """
+        Record an anonymised analytics event. Fire-and-forget — never raises.
+
+        Args:
+            guild_id:   The guild this event belongs to.
+            event_type: One of 'track_played', 'search', 'command_used',
+                        'circuit_breaker_tripped', etc.
+            payload:    Optional anonymised context dict (no user IDs).
+
+        Design note: called via asyncio.create_task() from hot paths so it
+        never blocks the Discord event loop on a DB write.
+        """
+        import json as _json
+        try:
+            payload_str = _json.dumps(payload or {})
+            async with self._connect() as conn:
+                await conn.execute(
+                    "INSERT INTO analytics (guild_id, event_type, payload)"
+                    " VALUES (?, ?, ?)",
+                    (guild_id, event_type, payload_str),
+                )
+                await conn.commit()
+        except Exception as exc:
+            logger.debug("analytics.log_event failed silently: %s", exc)
+
+    async def get_analytics(
+        self,
+        guild_id:   int,
+        event_type: str | None = None,
+        days:       int = 30,
+        limit:      int = 100,
+    ) -> list[dict]:
+        """
+        Return recent analytics events for *guild_id*.
+
+        Args:
+            guild_id:   Filter to this guild.
+            event_type: Optional filter by event type (None = all types).
+            days:       How many days back to look (default 30).
+            limit:      Maximum number of rows to return.
+        """
+        import json as _json
+        async with self._connect() as conn:
+            if event_type:
+                cursor = await conn.execute(
+                    "SELECT event_type, payload, ts FROM analytics"
+                    " WHERE guild_id = ? AND event_type = ?"
+                    "   AND ts > datetime('now', ? || ' days')"
+                    " ORDER BY ts DESC LIMIT ?",
+                    (guild_id, event_type, f"-{days}", limit),
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT event_type, payload, ts FROM analytics"
+                    " WHERE guild_id = ?"
+                    "   AND ts > datetime('now', ? || ' days')"
+                    " ORDER BY ts DESC LIMIT ?",
+                    (guild_id, f"-{days}", limit),
+                )
+            rows = await cursor.fetchall()
+
+        results = []
+        for row in rows:
+            try:
+                results.append({
+                    "event_type": row["event_type"],
+                    "payload":    _json.loads(row["payload"] or "{}"),
+                    "ts":         row["ts"],
+                })
+            except Exception:
+                pass
+        return results
+
+    async def get_top_tracks(
+        self,
+        guild_id: int,
+        days:     int = 30,
+        limit:    int = 10,
+    ) -> list[dict]:
+        """
+        Return the top *limit* most-played track titles for *guild_id*
+        over the last *days* days (derived from history table).
+        """
+        async with self._connect() as conn:
+            cursor = await conn.execute(
+                "SELECT track_data, COUNT(*) as play_count"
+                " FROM history"
+                " WHERE guild_id = ?"
+                "   AND played_at > datetime('now', ? || ' days')"
+                " GROUP BY track_data"
+                " ORDER BY play_count DESC"
+                " LIMIT ?",
+                (guild_id, f"-{days}", limit),
+            )
+            rows = await cursor.fetchall()
+
+        results = []
+        for row in rows:
+            try:
+                from models.track import Track as _Track
+                track = _Track.from_json(row["track_data"])
+                results.append({
+                    "title":      track.title,
+                    "url":        track.url,
+                    "play_count": row["play_count"],
+                })
+            except Exception:
+                pass
+        return results

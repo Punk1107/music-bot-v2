@@ -23,6 +23,12 @@ class Track:
         default_factory=lambda: datetime.now(timezone.utc)
     )
 
+    # ── Pre-fetch cache (runtime only — never serialised) ─────────────────────
+    # Populated by YouTubeExtractor.prefetch_stream_url() ~15s before playback.
+    # get_stream_url() returns this instantly if still valid (< 4 hours old).
+    stream_url_cache:   Optional[str]   = field(default=None, repr=False)
+    stream_url_expires: Optional[float] = field(default=None, repr=False)
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @property
@@ -45,6 +51,9 @@ class Track:
     def to_dict(self) -> dict:
         data = asdict(self)
         data["added_at"] = self.added_at.isoformat()
+        # Runtime-only fields — never persisted to DB or JSON
+        data.pop("stream_url_cache",   None)
+        data.pop("stream_url_expires", None)
         return data
 
     def to_json(self) -> str:
@@ -54,6 +63,9 @@ class Track:
     def from_dict(cls, data: dict) -> "Track":
         if isinstance(data.get("added_at"), str):
             data["added_at"] = datetime.fromisoformat(data["added_at"])
+        # Strip any runtime fields that may have been accidentally persisted
+        data.pop("stream_url_cache",   None)
+        data.pop("stream_url_expires", None)
         return cls(**data)
 
     @classmethod
