@@ -2,8 +2,13 @@
 """
 main.py — Music Bot V2 entry point.
 
-Initialises the bot, loads all cogs, wires up event handlers,
-and runs the asyncio event loop.
+V3 Changes:
+  - AudioBackend abstraction: bot.audio_backend = create_backend(config.AUDIO_BACKEND)
+  - CircuitBreaker instances for YouTube and Spotify (bot.yt_breaker, bot.sp_breaker)
+  - NLUPipeline wired as bot.nlu (feature-flagged via NLU_ENABLED)
+  - on_ready: queue auto-restore from DB (+ auto-resume if AUTO_RESUME=true)
+  - on_application_command_error: forwards full traceback to DEV_LOG_CHANNEL_ID
+  - /chat command registered for NLU (only when NLU_ENABLED=true)
 """
 
 from __future__ import annotations
@@ -11,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from collections import defaultdict
 from typing import Optional
 
 import aiohttp
@@ -26,13 +30,16 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 # ── Core modules ────────────────────────────────────────────────────────────────────
-from core.database import DatabaseManager
-from core.youtube  import YouTubeExtractor
-from core.spotify  import SpotifyExtractor
-from core.audio    import AudioEffectsProcessor
-from core.player   import GuildPlayer
+from core.database       import DatabaseManager
+from core.youtube        import YouTubeExtractor
+from core.spotify        import SpotifyExtractor
+from core.audio          import AudioEffectsProcessor
+from core.audio_backend  import AudioBackend, create_backend
+from core.circuit_breaker import CircuitBreaker
+from core.nlu            import NLUPipeline
+from core.player         import GuildPlayer
 from models.server_config import ServerConfig
-from utils.error_handler  import command_error_embed
+from utils.error_handler  import command_error_embed, forward_to_dev_channel
 
 # ── Optional keep-alive webserver ─────────────────────────────────────────────
 try:
@@ -56,7 +63,7 @@ class MusicBot(commands.Bot):
     """
     Top-level bot class.
 
-    Owns all shared singletons (DB, extractors, audio processor)
+    Owns all shared singletons (DB, extractors, audio processor, backends)
     and the per-guild GuildPlayer registry.
     """
 
@@ -80,6 +87,24 @@ class MusicBot(commands.Bot):
         self.youtube         = YouTubeExtractor()
         self.spotify         = SpotifyExtractor()
         self.audio_processor = AudioEffectsProcessor()
+
+        # ── P3-1: Audio backend (FFmpeg by default, Lavalink-ready) ──────────
+        self.audio_backend: AudioBackend = create_backend(config.AUDIO_BACKEND)
+
+        # ── P2-2: Circuit breakers for external APIs ──────────────────────────
+        self.yt_breaker: CircuitBreaker = CircuitBreaker(
+            name              = "youtube",
+            failure_threshold = config.CIRCUIT_BREAKER_THRESHOLD,
+            recovery_window   = config.CIRCUIT_BREAKER_WINDOW,
+        )
+        self.sp_breaker: CircuitBreaker = CircuitBreaker(
+            name              = "spotify",
+            failure_threshold = config.CIRCUIT_BREAKER_THRESHOLD,
+            recovery_window   = config.CIRCUIT_BREAKER_WINDOW,
+        )
+
+        # ── P4-1: NLU pipeline (feature-flagged) ──────────────────────────────
+        self.nlu = NLUPipeline()
 
         # ── Shared HTTP session (for thumbnail color extraction, etc.) ─────────
         # Initialised in setup_hook() once the event loop is running.
@@ -159,6 +184,69 @@ class MusicBot(commands.Bot):
             )
         )
 
+        # ── P2-3: Auto-restore queues from DB on startup ──────────────────────
+        await self._restore_queues_on_startup()
+
+    async def _restore_queues_on_startup(self) -> None:
+        """
+        P2-3: Restore persisted queues for all connected guilds.
+
+        For each guild where the bot is in a voice channel (or was previously),
+        loads the saved queue from SQLite into the in-memory GuildPlayer.
+
+        If AUTO_RESUME=true, also rejoins the voice channel and starts playback.
+        Otherwise, the queue is silently restored and will play on the next /play.
+        """
+        restored = 0
+        for guild in self.guilds:
+            try:
+                tracks = await self.db.load_queue(guild.id)
+                if not tracks:
+                    continue
+                player = self.get_player(guild.id)
+                await player.extend(tracks)
+                restored += 1
+                logger.info(
+                    "Restored %d tracks for guild %d from DB.",
+                    len(tracks), guild.id,
+                )
+
+                if config.AUTO_RESUME:
+                    await self._try_auto_resume(guild, player)
+
+            except Exception as exc:
+                logger.warning(
+                    "Failed to restore queue for guild %d: %s", guild.id, exc
+                )
+
+        if restored:
+            logger.info("Queue restore complete: %d guild(s) restored.", restored)
+
+    async def _try_auto_resume(self, guild: discord.Guild, player: GuildPlayer) -> None:
+        """
+        Attempt to rejoin the saved voice channel and resume playback.
+        Called only when AUTO_RESUME=true.
+        """
+        if not player.last_channel_id:
+            return
+        channel = guild.get_channel(player.last_channel_id)
+        if not channel or not isinstance(channel, discord.VoiceChannel):
+            return
+        try:
+            vc = await channel.connect(timeout=10.0, reconnect=True)
+            logger.info(
+                "AUTO_RESUME: Rejoined VC '%s' in guild %d.",
+                channel.name, guild.id,
+            )
+            # Trigger playback via the music cog's _play_next
+            music_cog = self.cogs.get("Music")
+            if music_cog and hasattr(music_cog, "_play_next"):
+                await music_cog._play_next(guild.id)
+        except Exception as exc:
+            logger.warning(
+                "AUTO_RESUME: Failed to rejoin VC for guild %d: %s", guild.id, exc
+            )
+
     async def close(self) -> None:
         """Graceful shutdown: persist all queues and close DB before disconnecting."""
         if self._shutdown:
@@ -233,8 +321,32 @@ class MusicBot(commands.Bot):
     async def on_application_command_error(
         self, interaction: discord.Interaction, error: Exception
     ) -> None:
-        """Global slash-command error handler — sends a user-friendly error embed."""
-        logger.error("Command error in guild %s: %s", interaction.guild_id, error, exc_info=True)
+        """
+        P2-5: Global slash-command error handler.
+
+        Sends a polite 'Command Failed' embed to the user, AND forwards the
+        full traceback to the configured DEV_LOG_CHANNEL_ID (if set).
+        """
+        logger.error(
+            "Command error in guild %s: %s", interaction.guild_id, error, exc_info=True
+        )
+
+        # ── Forward to dev channel (non-blocking, swallows errors) ──────────
+        asyncio.create_task(
+            forward_to_dev_channel(
+                self,
+                error,
+                context = "on_application_command_error",
+                guild_id = interaction.guild_id,
+                user_id  = interaction.user.id if interaction.user else None,
+                command  = (
+                    interaction.command.name
+                    if interaction.command else None
+                ),
+            )
+        )
+
+        # ── User-facing polite message ────────────────────────────────────────
         embed = command_error_embed(error)
         try:
             if interaction.response.is_done():
@@ -302,7 +414,7 @@ class MusicBot(commands.Bot):
                                 f"No listeners for **{idle_mins} minute{'s' if idle_mins != 1 else ''}** — "
                                 "disconnected to save resources.\n"
                                 f"*(บอทไม่มีคนฟังนานกว่า **{idle_mins} นาที** "
-                                "ออกจากห้องเสียงเพื่อประหยัดทรัพยากรแล้วนะครับ \u2764)*"
+                                "ออกจากห้องเสียงเพื่อประหยัดทรัพยากรแล้วนะครับ ❤)*"
                             ),
                             colour      = 0xFEE75C,
                         )

@@ -153,7 +153,7 @@ _ct_cache: dict[str, tuple[bool, float]] = {}
 _CT_TTL = 300  # seconds
 
 
-async def _is_audio_content_type(url: str) -> bool:
+async def _is_audio_content_type(url: str, session: aiohttp.ClientSession | None = None) -> bool:
     now = time.monotonic()
     if url in _ct_cache:
         result, ts = _ct_cache[url]
@@ -162,10 +162,15 @@ async def _is_audio_content_type(url: str) -> bool:
 
     try:
         timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.head(url, allow_redirects=True) as resp:
+        if session and not session.closed:
+            async with session.head(url, allow_redirects=True, timeout=timeout) as resp:
                 ct = resp.headers.get("Content-Type", "").lower()
                 is_audio = any(x in ct for x in ("audio", "mpegurl", "mpeg"))
+        else:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.head(url, allow_redirects=True) as resp:
+                    ct = resp.headers.get("Content-Type", "").lower()
+                    is_audio = any(x in ct for x in ("audio", "mpegurl", "mpeg"))
     except Exception as exc:
         logger.debug("Content-type check failed for %s: %s", url, exc)
         is_audio = False
@@ -237,13 +242,17 @@ def validate_search_query(query: str) -> ValidationResult:
     return ValidationResult(True)
 
 
-async def validate_url(url: str) -> ValidationResult:
+async def validate_url(url: str, *, session: aiohttp.ClientSession | None = None) -> ValidationResult:
     """
     Full URL validation pipeline:
       1. Banned-content pattern check
       2. Allowed-provider whitelist
       3. Direct audio file extension
       4. Content-Type header sniff (async, cached)
+
+    Args:
+        url:     The URL to validate.
+        session: Optional shared aiohttp session to reuse (avoids TCP overhead).
     """
     banned = is_banned(url)
     if not banned:
@@ -255,7 +264,7 @@ async def validate_url(url: str) -> ValidationResult:
     if is_direct_audio(url):
         return ValidationResult(True, "Direct audio file")
 
-    if await _is_audio_content_type(url):
+    if await _is_audio_content_type(url, session=session):
         return ValidationResult(True, "Audio content-type")
 
     return ValidationResult(False, "URL is not a recognised audio source")

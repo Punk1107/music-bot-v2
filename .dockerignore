@@ -1,0 +1,44 @@
+# ── .dockerignore — files excluded from Docker build context ──────────────────
+# Keeps the image small and prevents secrets from leaking into the image layer.
+
+# Secrets — NEVER include these in Docker builds
+.env
+cookies.txt
+
+# Git & IDE
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+.zencoder/
+.zenflow/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Test files (not needed in production image)
+tests/
+pytest.ini
+pyproject.toml
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Dev dependencies
+requirements-dev.txt
+
+# Local data (mounted as volumes at runtime)
+data/
+logs/
+
+# Documentation
+README.md
+*.md

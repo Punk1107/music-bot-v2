@@ -7,14 +7,16 @@ Provides:
 - Text-based search (with dedicated Track-level LRU cache)
 - YouTube playlist extraction
 - In-memory LRU-style result cache for raw yt-dlp responses
+- Predictive stream pre-fetching (P3-2)
+- Extraction concurrency throttle (P3-5)
 
-V3 Optimizations:
-  - Dedicated _search_cache stores resolved Track lists (not raw dicts) so
-    cache hits require zero re-parsing.  TTL & size from config.
-  - True exponential backoff: sleep(min(2**(attempt-1), 8)) → 1s, 2s, 4s
-  - asyncio.TimeoutError caught separately from generic Exception so
-    transient timeouts get WARNING level, code bugs get ERROR level.
-  - Existing _extract() dict cache is kept for URL lookups (unchanged).
+V4 Changes:
+  - _EXTRACT_SEM: module-level asyncio.Semaphore caps concurrent heavy yt-dlp
+    extractions at config.EXTRACT_CONCURRENCY (default 3) to prevent CPU spikes.
+  - prefetch_stream_url(): resolves CDN URL for next track in background and
+    caches on track.stream_url_cache / stream_url_expires (14400s TTL).
+  - get_stream_url(): checks track.stream_url_cache before calling yt-dlp —
+    cache hit returns instantly with zero API overhead.
 """
 
 from __future__ import annotations
@@ -32,6 +34,17 @@ import config
 from models.track import Track
 
 logger = logging.getLogger(__name__)
+
+# Module-level semaphore — limits concurrent heavy yt-dlp extractions (P3-5)
+_EXTRACT_SEM: asyncio.Semaphore | None = None  # initialised lazily on first use
+
+def _get_extract_sem() -> asyncio.Semaphore:
+    """Return (and lazily create) the module-level extraction semaphore."""
+    global _EXTRACT_SEM
+    if _EXTRACT_SEM is None:
+        _EXTRACT_SEM = asyncio.Semaphore(config.EXTRACT_CONCURRENCY)
+    return _EXTRACT_SEM
+
 
 _YOUTUBE_DOMAINS = frozenset(
     [
@@ -146,13 +159,8 @@ class YouTubeExtractor:
         Extract info for *query* with optional caching and retry logic.
         Runs the blocking yt-dlp call in a thread-pool executor.
 
+        Throttled by _EXTRACT_SEM to prevent concurrent CPU saturation (P3-5).
         Uses true exponential backoff: 1s → 2s → 4s (capped at 8s).
-
-        Args:
-            query:     URL or search string
-            opts:      yt-dlp options dict; defaults to _META_OPTS
-            use_cache: whether to read/write the in-memory dict cache
-            timeout:   asyncio timeout (seconds); defaults to config.YTDL_TIMEOUT
         """
         if opts is None:
             opts = _META_OPTS
@@ -172,39 +180,39 @@ class YouTubeExtractor:
         loop = asyncio.get_running_loop()
         last_exc: Exception | None = None
 
-        for attempt in range(1, config.YTDL_RETRIES + 1):
-            try:
-                result = await asyncio.wait_for(
-                    loop.run_in_executor(None, self._run_ytdl, opts, query),
-                    timeout=timeout,
-                )
-                if result and use_cache:
-                    async with self._cache_lock:
-                        self._cache[cache_key] = (result, time.monotonic())
-                        # Evict oldest entries when cache is full
-                        if len(self._cache) > config.YTDL_CACHE_MAX_SIZE:
-                            oldest = min(self._cache, key=lambda k: self._cache[k][1])
-                            del self._cache[oldest]
-                return result
+        async with _get_extract_sem():   # ← P3-5: throttle concurrent extractions
+            for attempt in range(1, config.YTDL_RETRIES + 1):
+                try:
+                    result = await asyncio.wait_for(
+                        loop.run_in_executor(None, self._run_ytdl, opts, query),
+                        timeout=timeout,
+                    )
+                    if result and use_cache:
+                        async with self._cache_lock:
+                            self._cache[cache_key] = (result, time.monotonic())
+                            # Evict oldest entries when cache is full
+                            if len(self._cache) > config.YTDL_CACHE_MAX_SIZE:
+                                oldest = min(self._cache, key=lambda k: self._cache[k][1])
+                                del self._cache[oldest]
+                    return result
 
-            except asyncio.TimeoutError:
-                # Transient timeout — warn but don't treat as code bug
-                backoff = min(2 ** (attempt - 1), 8)
-                logger.warning(
-                    "yt-dlp timeout attempt %d/%d for '%s' — backoff %ds",
-                    attempt, config.YTDL_RETRIES, query, backoff,
-                )
-                last_exc = asyncio.TimeoutError()
+                except asyncio.TimeoutError:
+                    backoff = min(2 ** (attempt - 1), 8)
+                    logger.warning(
+                        "yt-dlp timeout attempt %d/%d for '%s' — backoff %ds",
+                        attempt, config.YTDL_RETRIES, query, backoff,
+                    )
+                    last_exc = asyncio.TimeoutError()
 
-            except Exception as exc:
-                backoff = min(2 ** (attempt - 1), 8)
-                logger.warning(
-                    "yt-dlp error attempt %d/%d: %s", attempt, config.YTDL_RETRIES, exc
-                )
-                last_exc = exc
+                except Exception as exc:
+                    backoff = min(2 ** (attempt - 1), 8)
+                    logger.warning(
+                        "yt-dlp error attempt %d/%d: %s", attempt, config.YTDL_RETRIES, exc
+                    )
+                    last_exc = exc
 
-            if attempt < config.YTDL_RETRIES:
-                await asyncio.sleep(min(2 ** (attempt - 1), 8))
+                if attempt < config.YTDL_RETRIES:
+                    await asyncio.sleep(min(2 ** (attempt - 1), 8))
 
         logger.error(
             "yt-dlp failed after %d attempts for '%s': %s",
@@ -294,14 +302,25 @@ class YouTubeExtractor:
             return None
         return self._entry_to_track(entry)
 
-    async def get_stream_url(self, url: str) -> str | None:
+    async def get_stream_url(self, url: str, track: Optional[Track] = None) -> str | None:
         """
         Resolve *url* (a YouTube webpage URL) to a direct CDN audio-stream URL
         that FFmpeg can open.  Returns None on failure.
 
-        Always bypasses cache — CDN URLs expire after a few hours.
+        P3-2: If *track* is provided and has a valid pre-fetched stream URL
+        (stream_url_cache, not yet expired), returns it instantly without any
+        yt-dlp call. This gives gapless/instant playback for pre-fetched tracks.
+
+        Falls through to yt-dlp on cache miss or expiry.
+        Always bypasses the metadata cache — CDN URLs expire after a few hours.
         Uses optimized _STREAM_OPTS to minimize latency.
         """
+        # ── P3-2: Pre-fetch cache hit ─────────────────────────────────────────
+        if track and track.stream_url_cache and track.stream_url_expires:
+            if time.monotonic() < track.stream_url_expires:
+                logger.debug("Pre-fetch cache hit for '%s'", url[:60])
+                return track.stream_url_cache
+
         url = self._clean_url(url)
         loop = asyncio.get_running_loop()
         try:
@@ -322,6 +341,44 @@ class YouTubeExtractor:
         if not entry:
             return None
         return self._extract_stream_url(entry)
+
+    async def prefetch_stream_url(self, track: Track) -> None:
+        """
+        P3-2: Pre-fetch and cache the CDN stream URL for *track*.
+
+        Stores the resolved URL on track.stream_url_cache with a TTL of
+        config.STREAM_URL_TTL seconds (default 4 hours). When get_stream_url()
+        is later called for this track, it returns the cached URL instantly.
+
+        Designed to be called via asyncio.create_task() with a leading sleep:
+            asyncio.create_task(_prefetch_after_delay(track, delay=T - 15))
+
+        Silently swallows all exceptions — pre-fetch failures are non-fatal.
+        The fallback path in get_stream_url() will handle it at playback time.
+        """
+        try:
+            url = self._clean_url(track.url)
+            loop = asyncio.get_running_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, self._run_ytdl, _STREAM_OPTS, url),
+                timeout=config.YTDL_STREAM_TIMEOUT + 5,
+            )
+            if not result:
+                return
+            entry = (result.get("entries") or [result])[0]
+            if not entry:
+                return
+            stream_url = self._extract_stream_url(entry)
+            if stream_url:
+                track.stream_url_cache   = stream_url
+                track.stream_url_expires = time.monotonic() + config.STREAM_URL_TTL
+                logger.debug(
+                    "Pre-fetched stream URL for '%s' (expires in %.0fs)",
+                    track.title[:50], config.STREAM_URL_TTL,
+                )
+        except Exception as exc:
+            # Non-fatal — playback will fall back to on-demand resolution
+            logger.debug("Pre-fetch failed for '%s': %s", track.url[:60], exc)
 
     async def search(self, query: str, max_results: int = 10) -> list[Track]:
         """
@@ -401,7 +458,6 @@ class YouTubeExtractor:
             if not entry:
                 continue
             title = entry.get("title") or entry.get("ie_key", "Unknown")
-            # Prefer webpage_url; fall back to constructing from video id
             video_id  = entry.get("id", "")
             video_url = (
                 entry.get("url")
@@ -410,10 +466,9 @@ class YouTubeExtractor:
             )
             if not video_url or not title:
                 continue
-            # Duration from flat entry (may be 0 for live/unavailable entries)
             duration = int(entry.get("duration") or 0)
             if duration > config.MAX_TRACK_LENGTH:
-                continue  # Skip tracks that exceed length limit
+                continue
             track = Track(
                 title       = title,
                 url         = video_url,

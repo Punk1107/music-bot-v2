@@ -2,13 +2,15 @@
 """
 cogs/music.py — Core music playback commands.
 
-V3 Changes:
-  - asyncio.gather with Semaphore(5) for parallel Spotify→YouTube resolution
-  - Self-healing _try_reconnect() on unexpected voice disconnect
-  - Dynamic embed accent color from thumbnail via color_thief.get_dominant_color()
-  - All player queue mutations use new async methods (enqueue, dequeue, etc.)
-  - track_added_embed confirmation messages persist permanently (no auto-delete)
-  - voice_connection_error_embed for reconnect failure notification
+V4 Changes:
+  - Circuit Breaker guards on yt_breaker (P2-2): get_stream_url + search wrapped
+    so sustained failures trip the breaker and show 'System Busy' to users.
+  - AudioBackend abstraction (P3-1): vc.play(FFmpegPCMAudio) replaced by
+    bot.audio_backend.play() — swap to Lavalink with one config change.
+  - Predictive pre-fetch (P3-2): _schedule_prefetch() fires asyncio.create_task
+    ~15s before the current track ends to resolve the next CDN URL in background.
+  - Shared session passed to validate_url (P3-4): no per-call TCP handshake.
+  - Analytics fire-and-forget (P4-2): log_event() called on every play/search.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from discord.ext import commands
 import config
 from core.validator import validate_url, validate_search_query
 from models.track import Track
+from core.circuit_breaker import CircuitBreakerOpen
 from utils.embeds import (
     error_embed, success_embed, info_embed,
     now_playing_embed, track_added_embed, search_results_embed,
@@ -187,8 +190,26 @@ class MusicCog(commands.Cog, name="Music"):
             return  # Queue exhausted
 
         # Resolve the actual CDN audio-stream URL via yt-dlp.
+        # P2-2: Wrapped in circuit breaker — trips after sustained failures.
         try:
-            stream_url = await self.bot.youtube.get_stream_url(next_track.url)
+            stream_url = await self.bot.yt_breaker.call(
+                self.bot.youtube.get_stream_url,
+                next_track.url,
+                next_track,          # allows pre-fetch cache hit (P3-2)
+            )
+        except CircuitBreakerOpen as exc:
+            # Circuit is OPEN — inform user and stop this guild's playback
+            logger.warning("YouTube circuit breaker OPEN for guild %d: %s", guild_id, exc)
+            if player.text_channel:
+                busy_embed = error_embed(
+                    "⚡ System Busy",
+                    f"YouTube is temporarily unavailable (too many errors).\n"
+                    f"Retrying automatically in **{exc.retry_after:.0f}s**.\n"
+                    "*(YouTube ไม่พร้อมใช้งานชั่วคราว — บอทจะลองใหม่อีกครั้ง)*",
+                )
+                await player.text_channel.send(embed=busy_embed)
+            player.reset()
+            return
         except Exception as exc:
             logger.error("Failed to resolve stream for '%s': %s", next_track.title, exc)
             # Guard against infinite recursion
@@ -229,7 +250,6 @@ class MusicCog(commands.Cog, name="Music"):
         def after_play(exc: Optional[Exception]) -> None:
             if exc:
                 logger.error("Playback error in guild %d: %s", guild_id, exc)
-            # Guard against scheduling into a closed loop (e.g. during shutdown)
             if self.bot._shutdown:
                 return
             try:
@@ -239,16 +259,18 @@ class MusicCog(commands.Cog, name="Music"):
             except RuntimeError:
                 logger.debug("Could not schedule _play_next — event loop closed.")
 
+        # P3-1: Use audio backend abstraction instead of FFmpegPCMAudio directly
         try:
-            source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_opts)
-            vc.play(source, after=after_play)
+            await self.bot.audio_backend.play(
+                vc, stream_url, after_play, ffmpeg_opts=ffmpeg_opts
+            )
         except Exception as exc:
-            logger.error("FFmpeg error for '%s': %s", next_track.title, exc)
+            logger.error("Audio backend error for '%s': %s", next_track.title, exc)
             if skip_depth < config.SKIP_ERROR_LIMIT:
                 await self._play_next(guild_id, skip_depth=skip_depth + 1)
             return
 
-        # ── Save to DB + resolve accent color in parallel (asyncio.gather) ─────
+        # ── DB record + color resolve + analytics in parallel ────────────────
         async def _record_db():
             try:
                 await self.bot.db.record_track_played(
@@ -264,7 +286,19 @@ class MusicCog(commands.Cog, name="Music"):
             )
             player.accent_color = color
 
-        await asyncio.gather(_record_db(), _resolve_color())
+        async def _log_analytics():
+            try:
+                await self.bot.db.log_event(
+                    guild_id, "track_played",
+                    {"title": next_track.title[:80], "duration": next_track.duration},
+                )
+            except Exception:
+                pass
+
+        await asyncio.gather(_record_db(), _resolve_color(), _log_analytics())
+
+        # P3-2: Schedule pre-fetch of the NEXT track ~15s before this one ends
+        self._schedule_prefetch(guild_id, next_track.duration)
 
         # Cancel any previous progress-bar updater for this guild
         if player.progress_task and not player.progress_task.done():
@@ -315,6 +349,30 @@ class MusicCog(commands.Cog, name="Music"):
                     )
             except Exception as exc:
                 logger.warning("Could not send now-playing message: %s", exc)
+
+    # ── P3-2: Predictive pre-fetch ────────────────────────────────────────────
+
+    def _schedule_prefetch(self, guild_id: int, current_duration: int) -> None:
+        """
+        Schedule a background pre-fetch of the next track's CDN stream URL.
+        Fires config.PREFETCH_BEFORE_END seconds before the current track ends.
+        The resolved URL is cached on the Track object for instant retrieval.
+        """
+        player = self.bot.get_player(guild_id)
+        next_track = player.peek_next()
+        if not next_track or current_duration <= 0:
+            return
+
+        delay = max(0, current_duration - config.PREFETCH_BEFORE_END)
+
+        async def _prefetch_task():
+            await asyncio.sleep(delay)
+            # Re-check the player hasn't moved on
+            p = self.bot.get_player(guild_id)
+            if p.peek_next() is next_track:
+                await self.bot.youtube.prefetch_stream_url(next_track)
+
+        asyncio.create_task(_prefetch_task())
 
     # ── Progress bar updater ──────────────────────────────────────────────────
 
@@ -461,7 +519,9 @@ class MusicCog(commands.Cog, name="Music"):
 
         # Validate URL or search text
         if query.startswith("http"):
-            result = await validate_url(query)
+            result = await validate_url(
+                query, session=getattr(self.bot, "http_session", None)
+            )
             if not result:
                 await interaction.followup.send(
                     embed=error_embed("🚫 Blocked URL",

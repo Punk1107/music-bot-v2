@@ -10,12 +10,16 @@ Provides:
 - playback_error_embed()         — Rich red embed for playback failures
 - notify_playback_error()        — Send error notification to text channel
 - command_error_embed()          — Slash-command error embed
-- voice_connection_error_embed() — Voice reconnect failure embed [NEW]
+- voice_connection_error_embed() — Voice reconnect failure embed
+- dev_error_embed()              — Full traceback embed for the dev channel [NEW]
+- forward_to_dev_channel()       — Send dev_error_embed to the configured channel [NEW]
 """
 
 from __future__ import annotations
 
 import logging
+import traceback
+from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
 import discord
@@ -83,7 +87,6 @@ def classify_ytdl_error(exc: Exception) -> tuple[str, str, str]:
             "Too many requests to YouTube. Please wait a moment and try again.\n"
             "*(ดึงข้อมูลจาก YouTube ถี่เกินไป กรุณารอสักครู่)*",
         )
-    # Separate timeout classification from generic network errors
     if "timeout" in msg or "timed out" in msg:
         return (
             YTDLErrorType.TIMEOUT,
@@ -191,6 +194,86 @@ def voice_connection_error_embed(
     )
     e.set_footer(text="Music Bot V2 • Self-Healing System")
     return e
+
+
+# ── P2-5: Developer channel error forwarding ──────────────────────────────────
+
+def dev_error_embed(
+    exc:         Exception,
+    *,
+    context:     str = "",
+    guild_id:    Optional[int] = None,
+    user_id:     Optional[int] = None,
+    command:     Optional[str] = None,
+) -> discord.Embed:
+    """
+    Build a detailed traceback embed for the private dev channel.
+
+    Includes the full exception chain, guild/user/command context, and timestamp.
+    Never shown to end-users — only sent to the DEV_LOG_CHANNEL_ID channel.
+    """
+    tb_str = traceback.format_exc()
+    if len(tb_str) > 1800:
+        tb_str = "..." + tb_str[-1800:]
+
+    e = discord.Embed(
+        title       = f"🔥 Unhandled Exception: `{type(exc).__name__}`",
+        description = f"```python\n{tb_str}\n```",
+        colour      = 0xFF0000,
+        timestamp   = datetime.now(timezone.utc),
+    )
+
+    if context:
+        e.add_field(name="📍 Context", value=f"`{context}`", inline=False)
+
+    ctx_parts = []
+    if guild_id:
+        ctx_parts.append(f"**Guild:** `{guild_id}`")
+    if user_id:
+        ctx_parts.append(f"**User:** `{user_id}`")
+    if command:
+        ctx_parts.append(f"**Command:** `/{command}`")
+    if ctx_parts:
+        e.add_field(name="🗂️ Where", value="\n".join(ctx_parts), inline=False)
+
+    e.set_footer(text="Music Bot V2 • Global Exception Interceptor")
+    return e
+
+
+async def forward_to_dev_channel(
+    bot,
+    exc: Exception,
+    *,
+    context: str = "",
+    guild_id: Optional[int] = None,
+    user_id:  Optional[int] = None,
+    command:  Optional[str] = None,
+) -> None:
+    """
+    Send a dev_error_embed to the configured DEV_LOG_CHANNEL_ID, if set.
+
+    Silently does nothing if:
+    - DEV_LOG_CHANNEL_ID is not configured
+    - The channel cannot be found
+    - The bot lacks permission to send messages there
+    """
+    import config
+    if not config.DEV_LOG_CHANNEL_ID:
+        return
+    try:
+        channel = bot.get_channel(config.DEV_LOG_CHANNEL_ID)
+        if channel is None:
+            channel = await bot.fetch_channel(config.DEV_LOG_CHANNEL_ID)
+        embed = dev_error_embed(
+            exc,
+            context  = context,
+            guild_id = guild_id,
+            user_id  = user_id,
+            command  = command,
+        )
+        await channel.send(embed=embed)
+    except Exception as send_exc:
+        logger.debug("Could not forward error to dev channel: %s", send_exc)
 
 
 # ── Channel notifier ──────────────────────────────────────────────────────────
