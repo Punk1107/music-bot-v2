@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import pytest
 
-from utils.views import MusicControlView, QueueView
+from utils.views import MusicControlView, QueueView, SearchSelectView
 from models.track import Track
 from models.enums import LoopMode
 
@@ -159,3 +159,102 @@ async def test_queue_view_rebuild_select(mock_bot, mock_player):
     view._rebuild_select()
     select = [c for c in view.children if getattr(c, "custom_id", None) == "queue_track_select"]
     assert len(select[0].options) == 5
+
+@pytest.mark.asyncio
+async def test_music_control_stop(mock_bot, mock_player, mock_interaction):
+    """Test MusicControlView stop button callback. Covers lines 257-287"""
+    mock_bot.get_player.return_value = mock_player
+    mock_guild = MagicMock()
+    mock_vc = MagicMock()
+    mock_vc.disconnect = AsyncMock()
+    mock_guild.voice_client = mock_vc
+    mock_interaction.user.voice.channel = mock_vc.channel
+    mock_bot.get_guild.return_value = mock_guild
+    
+    view = MusicControlView(bot=mock_bot, guild_id=123)
+    stop_btn = [c for c in view.children if getattr(c, "custom_id", None) == "mb_stop"][0]
+    
+    await stop_btn.callback(mock_interaction)
+    
+    mock_player.reset.assert_called_once()
+    mock_vc.stop.assert_called_once()
+    mock_vc.disconnect.assert_called_once()
+    mock_interaction.response.edit_message.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_search_select_view(mock_interaction):
+    """Test SearchSelectView on_select callback. Covers lines 397-431"""
+    tracks = [Track(f"T{i}", "http://url", 100, "thumb", "Up") for i in range(15)]
+    mock_callback = AsyncMock()
+    
+    view = SearchSelectView(tracks=tracks, callback=mock_callback)
+    
+    # Assert options truncated correctly
+    select = view.children[0]
+    assert len(select.options) == 10
+    
+    # Fire on_select
+    await select.callback(mock_interaction)
+    
+    mock_interaction.response.defer.assert_called_once()
+    mock_callback.assert_called_once_with(2)  # value is "2"
+
+    # Test Exception flow
+    mock_callback.side_effect = Exception("Test Fail")
+    view2 = SearchSelectView(tracks=tracks, callback=mock_callback)
+    select2 = view2.children[0]
+    await select2.callback(mock_interaction)
+    mock_interaction.followup.send.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_queue_view_on_track_select(mock_bot, mock_player, mock_interaction):
+    """Test QueueView dynamic action buttons injection. Covers lines 563-604"""
+    mock_bot.get_player.return_value = mock_player
+    view = QueueView(bot=mock_bot, guild_id=123)
+    
+    # Manually trigger select callback
+    await view._on_track_select(mock_interaction)
+    
+    # Check that remove/top/cancel buttons were injected
+    action_buttons = [c for c in view.children if getattr(c, "custom_id", None) in {"queue_action_remove", "queue_action_top", "queue_action_cancel"}]
+    assert len(action_buttons) == 3
+    
+    mock_interaction.response.edit_message.assert_called_once()
+
+@pytest.mark.asyncio
+@patch("asyncio.sleep", AsyncMock())
+async def test_queue_view_on_action_remove(mock_bot, mock_player, mock_interaction):
+    """Test queue view removal. Covers _on_action_remove logic"""
+    mock_bot.get_player.return_value = mock_player
+    view = QueueView(bot=mock_bot, guild_id=123)
+    
+    # Test with no selected idx
+    view._selected_idx = None
+    await view._on_action_remove(mock_interaction)
+    mock_interaction.response.defer.assert_called_once()
+    
+    # Test with selected idx
+    mock_interaction.reset_mock()
+    view._selected_idx = 2
+    
+    # Setup player.remove to return a mock track
+    mock_removed_track = Track("Removed Title", "http://url", 100, "thumb", "Uploader")
+    mock_player.remove = AsyncMock(return_value=mock_removed_track)
+    
+    await view._on_action_remove(mock_interaction)
+    
+    mock_player.remove.assert_called_once_with(2)
+    assert view._selected_idx is None
+    mock_interaction.response.edit_message.assert_called_once()
+    mock_interaction.edit_original_response.assert_called_once()
+    
+    # Test failed removal (returns None)
+    mock_interaction.reset_mock()
+    view._selected_idx = 2
+    mock_player.remove = AsyncMock(return_value=None)
+    
+    await view._on_action_remove(mock_interaction)
+    mock_interaction.response.edit_message.assert_called_once()
+    
+    args, kwargs = mock_interaction.response.edit_message.call_args
+    assert "no longer in the queue" in kwargs["embed"].description

@@ -49,7 +49,7 @@ async def test_nlu_openai_parse(mock_getenv, mock_openai_response):
     mock_post = AsyncMock()
     mock_response = AsyncMock()
     mock_response.json.return_value = mock_openai_response
-    mock_response.raise_for_status = AsyncMock()
+    mock_response.raise_for_status = MagicMock()
     mock_post.__aenter__.return_value = mock_response
     mock_session.post.return_value = mock_post
 
@@ -83,7 +83,7 @@ async def test_nlu_anthropic_parse(mock_getenv, mock_anthropic_response):
     mock_post = AsyncMock()
     mock_response = AsyncMock()
     mock_response.json.return_value = mock_anthropic_response
-    mock_response.raise_for_status = AsyncMock()
+    mock_response.raise_for_status = MagicMock()
     mock_post.__aenter__.return_value = mock_response
     mock_session.post.return_value = mock_post
 

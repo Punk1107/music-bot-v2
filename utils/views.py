@@ -251,7 +251,7 @@ class MusicControlView(discord.ui.View):
         custom_id="mb_stop",
         row=0,
     )
-    async def stop(
+    async def stop_playback(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if not await self._check(interaction):
