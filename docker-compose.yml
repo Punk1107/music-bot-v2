@@ -1,0 +1,61 @@
+# ── Music Bot V2 — Docker Compose ────────────────────────────────────────────
+# P4-3: Containerisation-ready orchestration
+#
+# Usage:
+#   docker compose up -d          # start in background
+#   docker compose logs -f bot    # tail logs
+#   docker compose down           # stop and remove containers
+
+services:
+  bot:
+    build: .
+    image: musicbot-v2:latest
+    container_name: musicbot_v2
+    restart: unless-stopped
+
+    # Load all secrets from your .env file (never commit .env to git)
+    env_file:
+      - .env
+
+    # Optional env overrides (can override .env values here)
+    environment:
+      - DATABASE_PATH=/app/data/musicbot.db
+      - LOG_LEVEL=INFO
+
+    # Persist the SQLite database and log files across container restarts
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # Optional: mount a cookies.txt for age-restricted / signed-in YouTube
+      # - ./cookies.txt:/app/cookies.txt:ro
+
+    # Health check matches the /health endpoint in webserver.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+    # Expose the keep-alive port (optional — only if using UptimeRobot)
+    ports:
+      - "8080:8080"
+
+    # Limit resource usage to avoid impacting other services on the host
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # ── Optional: Redis (uncomment when ready to upgrade from in-memory cache) ──
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: musicbot_redis
+  #   restart: unless-stopped
+  #   volumes:
+  #     - redis_data:/data
+  #   command: redis-server --save 60 1 --loglevel warning
+
+# volumes:
+#   redis_data:
