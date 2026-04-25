@@ -15,6 +15,9 @@ from typing import TYPE_CHECKING, Any
 import discord
 from aiohttp import web
 
+# 1. สร้าง Key ที่ระบุประเภทชัดเจน (ไว้บนสุดของไฟล์)
+BOT_KEY = web.AppKey("bot", object)
+
 if TYPE_CHECKING:
     from discord.ext import commands
 
@@ -222,16 +225,15 @@ async def error_middleware(request: web.Request, handler) -> web.Response:
 
 async def handle_root(request: web.Request) -> web.Response:
     """Render the stylish HTML dashboard."""
-    bot = request.app["bot"]
+    bot = request.app[BOT_KEY]
     stats = get_bot_stats(bot)
 
-    html = HTML_TEMPLATE.format(
-        uptime=stats["uptime"],
-        latency=stats["latency"],
-        guilds=stats["guilds"],
-        players=stats["players"],
-        timestamp=stats["timestamp"],
-    )
+    html = HTML_TEMPLATE
+    html = html.replace("{uptime}", str(stats["uptime"]))
+    html = html.replace("{latency}", str(stats["latency"]))
+    html = html.replace("{guilds}", str(stats["guilds"]))
+    html = html.replace("{players}", str(stats["players"]))
+    html = html.replace("{timestamp}", str(stats["timestamp"]))
     return web.Response(text=html, content_type="text/html")
 
 
@@ -242,14 +244,14 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def handle_status(request: web.Request) -> web.Response:
     """Detailed JSON payload of bot metrics."""
-    bot = request.app["bot"]
+    bot = request.app[BOT_KEY]
     stats = get_bot_stats(bot)
     return web.json_response(stats)
 
 
 async def handle_ready(request: web.Request) -> web.Response:
     """Readiness probe. Returns 200 if connected to gateway, else 503."""
-    bot = request.app["bot"]
+    bot = request.app[BOT_KEY]
     if bot.is_ready():
         return web.json_response({"status": "ready"}, status=200)
     return web.json_response({"status": "starting"}, status=503)
@@ -261,7 +263,7 @@ async def start_webserver(bot: "commands.Bot") -> web.AppRunner:
     Returns the AppRunner to allow graceful shutdown later.
     """
     app = web.Application(middlewares=[error_middleware])
-    app["bot"] = bot
+    app[BOT_KEY] = bot
 
     app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
