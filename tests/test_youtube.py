@@ -128,3 +128,69 @@ async def test_search_cache_logic(extractor):
         with patch.object(extractor, "_extract", return_value=mock_entry) as mock_extract:
             await extractor.search("new_query", max_results=1)
             assert len(extractor._search_cache) <= 1
+import pytest
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from core.youtube import YouTubeExtractor
+from models.track import Track
+
+@pytest.mark.asyncio
+@patch("core.youtube.YouTubeExtractor._run_ytdl")
+async def test_prefetch_stream_url(mock_run_ytdl):
+    """Test prefetching a stream url in the background. Covers lines 359-381"""
+    extractor = YouTubeExtractor()
+    track = Track("Title", "http://url", 100, None, "Uploader")
+    
+    # Test successful prefetch
+    mock_run_ytdl.return_value = {"entries": [{"url": "http://stream_url", "acodec": "opus", "vcodec": "none"}]}
+    await extractor.prefetch_stream_url(track)
+    assert track.stream_url_cache == "http://stream_url"
+    assert track.stream_url_expires > 0
+    
+    # Test failure does not crash
+    mock_run_ytdl.side_effect = Exception("YTDL Error")
+    track.stream_url_cache = None
+    await extractor.prefetch_stream_url(track)
+    assert track.stream_url_cache is None
+    
+    # Test timeout
+    async def timeout_ytdl(*args, **kwargs):
+        await asyncio.sleep(0.5)
+        return {"url": "slow"}
+    
+    with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
+        await extractor.prefetch_stream_url(track)
+    assert track.stream_url_cache is None
+
+@pytest.mark.asyncio
+@patch("core.youtube.YouTubeExtractor._run_ytdl")
+async def test_get_playlist_info(mock_run_ytdl):
+    """Test playlist extraction logic. Covers lines 439-484"""
+    extractor = YouTubeExtractor()
+    
+    # Test valid playlist
+    mock_run_ytdl.return_value = {
+        "entries": [
+            {"title": "Track 1", "id": "1", "url": "http://1", "duration": 100},
+            {"title": "Track 2", "id": "2", "url": "http://2", "duration": 200},
+            {"title": "Too Long", "id": "3", "url": "http://3", "duration": 999999}, # Exceeds MAX_TRACK_LENGTH
+            None, # Invalid entry
+            {"id": "5"} # Missing title/url
+        ]
+    }
+    
+    tracks = await extractor.get_playlist("http://playlist", max_tracks=10)
+    assert len(tracks) == 3
+    assert tracks[0].title == "Track 1"
+    assert tracks[1].title == "Track 2"
+    
+    # Test exception fallbacks
+    mock_run_ytdl.side_effect = Exception("Playlist fail")
+    tracks_err = await extractor.get_playlist("http://playlist", max_tracks=10)
+    assert tracks_err == []
+    
+    # Test timeout
+    with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
+        tracks_to = await extractor.get_playlist("http://playlist", max_tracks=10)
+        assert tracks_to == []
