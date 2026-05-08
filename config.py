@@ -40,6 +40,11 @@ DEV_LOG_CHANNEL_ID: int | None = (
 # ── Auto-resume on startup (P2-3: State recovery) ─────────────────────────────
 AUTO_RESUME: bool = os.getenv("AUTO_RESUME", "false").lower() == "true"
 
+# ── Sync slash commands on startup (P2-4) ─────────────────────────────────────
+# Set to true only if you have added/removed slash commands and need to update Discord.
+# Frequent syncing leads to 429 Rate Limits.
+SYNC_COMMANDS: bool = os.getenv("SYNC_COMMANDS", "false").lower() == "true"
+
 # ── AI NLU (P4-1) ────────────────────────────────────────────────────────────
 NLU_ENABLED: bool = os.getenv("NLU_ENABLED", "false").lower() == "true"
 

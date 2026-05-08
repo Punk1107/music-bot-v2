@@ -161,11 +161,14 @@ class MusicBot(commands.Bot):
                 logger.error("Failed to load cog %s: %s", ext, exc, exc_info=True)
 
         # Sync slash commands (global)
-        try:
-            synced = await self.tree.sync()
-            logger.info("Synced %d application commands.", len(synced))
-        except discord.HTTPException as exc:
-            logger.error("Failed to sync application commands: %s", exc)
+        if config.SYNC_COMMANDS:
+            try:
+                synced = await self.tree.sync()
+                logger.info("Synced %d application commands.", len(synced))
+            except discord.HTTPException as exc:
+                logger.error("Failed to sync application commands: %s", exc)
+        else:
+            logger.info("Skipping command sync (SYNC_COMMANDS=false). Use !sync to update slash commands.")
 
         # Start background tasks
         self._idle_checker.start()
@@ -298,6 +301,19 @@ class MusicBot(commands.Bot):
 
         await super().close()
         logger.info("Bot disconnected cleanly.")
+
+    @commands.command(name="sync", hidden=True)
+    @commands.is_owner()
+    async def sync_commands(self, ctx: commands.Context) -> None:
+        """Manually sync application commands (owner only)."""
+        msg = await ctx.send("🔄 Syncing global application commands...")
+        try:
+            synced = await self.tree.sync()
+            await msg.edit(content=f"✅ Successfully synced {len(synced)} commands.")
+            logger.info("Manual sync: synced %d commands.", len(synced))
+        except Exception as exc:
+            await msg.edit(content=f"❌ Sync failed: {exc}")
+            logger.error("Manual sync failed: %s", exc)
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
@@ -479,7 +495,9 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
 
     def _shutdown_handler():
-        loop.create_task(bot.close())
+        # Prevent double shutdown
+        if not bot._shutdown:
+            loop.create_task(bot.close())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -487,9 +505,19 @@ async def main() -> None:
         except NotImplementedError:
             pass  # Windows does not support add_signal_handler for all signals
 
-    async with bot:
-        await bot.start(config.TOKEN)
+    try:
+        async with bot:
+            await bot.start(config.TOKEN)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # Already handled by _shutdown_handler or library
+        pass
+    except Exception as exc:
+        logger.critical("Unexpected error in main: %s", exc, exc_info=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Final catch for KeyboardInterrupt outside the loop
+        pass
