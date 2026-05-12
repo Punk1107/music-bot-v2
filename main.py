@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 main.py — Music Bot V2 entry point.
 
@@ -489,14 +489,14 @@ class MusicBot(commands.Bot):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    bot = MusicBot()
-
     # Graceful SIGINT / SIGTERM handling
     loop = asyncio.get_running_loop()
 
+    bot: MusicBot | None = None
+
     def _shutdown_handler():
         # Prevent double shutdown
-        if not bot._shutdown:
+        if bot is not None and not bot._shutdown:
             loop.create_task(bot.close())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -509,6 +509,8 @@ async def main() -> None:
     # Invalid Session on first connect) that would otherwise silently kill the bot.
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
+        bot = MusicBot()
+
         try:
             async with bot:
                 await bot.start(config.TOKEN)
