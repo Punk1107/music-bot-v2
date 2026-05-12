@@ -489,26 +489,28 @@ class MusicBot(commands.Bot):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    bot = MusicBot()
-
-    # Graceful SIGINT / SIGTERM handling
     loop = asyncio.get_running_loop()
-
-    def _shutdown_handler():
-        # Prevent double shutdown
-        if not bot._shutdown:
-            loop.create_task(bot.close())
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _shutdown_handler)
-        except NotImplementedError:
-            pass  # Windows does not support add_signal_handler for all signals
 
     # Retry loop: handles transient gateway rejections (e.g. Discord OPCODE 9
     # Invalid Session on first connect) that would otherwise silently kill the bot.
+    # NOTE: A *fresh* MusicBot is created on every attempt so that its
+    # aiohttp.ClientSession (and all other state) is never reused after close().
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
+        bot = MusicBot()
+
+        # Graceful SIGINT / SIGTERM handling — re-register each attempt so the
+        # handler always references the current bot instance.
+        def _shutdown_handler(_bot=bot):
+            if not _bot._shutdown:
+                loop.create_task(_bot.close())
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _shutdown_handler)
+            except NotImplementedError:
+                pass  # Windows does not support add_signal_handler for all signals
+
         try:
             async with bot:
                 await bot.start(config.TOKEN)
