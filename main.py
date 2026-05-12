@@ -507,6 +507,8 @@ async def main() -> None:
 
     # Retry loop: handles transient gateway rejections (e.g. Discord OPCODE 9
     # Invalid Session on first connect) that would otherwise silently kill the bot.
+    # NOTE: A *fresh* MusicBot is created on every attempt so that its
+    # aiohttp.ClientSession (and all other state) is never reused after close().
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         bot = MusicBot()
