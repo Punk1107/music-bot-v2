@@ -7,6 +7,7 @@ asyncio event loop. Provides zero-blocking endpoints for rendering status,
 health probes, and a dashboard.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -261,6 +262,12 @@ async def start_webserver(bot: "commands.Bot") -> web.AppRunner:
     """
     Start the aiohttp web server using the bot's event loop.
     Returns the AppRunner to allow graceful shutdown later.
+
+    Uses reuse_address=True (SO_REUSEADDR) so the OS immediately allows
+    re-binding to the same port after a previous process exits — this fixes
+    the Windows "must run twice" bug caused by TIME_WAIT socket lingering.
+    A 3-attempt retry loop with exponential back-off handles the rare case
+    where the port is still briefly held by the OS between attempts.
     """
     app = web.Application(middlewares=[error_middleware])
     app[BOT_KEY] = bot
@@ -270,12 +277,36 @@ async def start_webserver(bot: "commands.Bot") -> web.AppRunner:
     app.router.add_get("/status", handle_status)
     app.router.add_get("/ready", handle_ready)
 
-    runner = web.AppRunner(app, access_log=None) # Disable noisy access logs to save CPU
+    runner = web.AppRunner(app, access_log=None)  # Disable noisy access logs to save CPU
     await runner.setup()
 
     port = int(os.getenv("PORT", "8080"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
 
-    logger.info("✅ Async Enterprise Webserver started natively on port %d.", port)
-    return runner
+    # Retry up to 3 times in case the port is still in TIME_WAIT from a
+    # previous run (common on Windows when restarting the bot quickly).
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            site = web.TCPSite(
+                runner,
+                "0.0.0.0",
+                port,
+                reuse_address=True,  # SO_REUSEADDR — allow fast rebind after restart
+            )
+            await site.start()
+            logger.info("✅ Async Enterprise Webserver started natively on port %d.", port)
+            return runner
+        except OSError as exc:
+            last_exc = exc
+            logger.warning(
+                "Webserver failed to bind on port %d (attempt %d/3): %s",
+                port, attempt, exc,
+            )
+            if attempt < 3:
+                await asyncio.sleep(2 * attempt)  # back-off: 2 s, 4 s
+
+    # All retries exhausted — clean up runner then propagate to setup_hook
+    await runner.cleanup()
+    raise RuntimeError(
+        f"Webserver could not bind to port {port} after 3 attempts."
+    ) from last_exc
