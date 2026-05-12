@@ -117,8 +117,24 @@ class MusicBot(commands.Bot):
         self._config_cache: dict[int, ServerConfig] = {}
 
         self._shutdown = False
+        self._ready_fired = False  # guard: on_ready runs setup only once per instance
         self.start_time = discord.utils.utcnow()
 
+        # Robust scheduling: discord.py schedules events via `self.loop.create_task`.
+        # In rare races the client `self.loop` can be set to `discord.utils.MISSING`
+        # (a sentinel) while background tasks are still dispatching events which
+        # causes AttributeError: '_MissingSentinel' object has no attribute
+        # 'create_task'. Use a safe scheduler that falls back to the currently
+        # running loop when necessary.
+        def _safe_schedule_event(coro: callable, event_name: str, *args, **kwargs):
+            wrapped = self._run_event(coro, event_name, *args, **kwargs)
+            loop = getattr(self, "loop", None)
+            if loop is discord.utils.MISSING or not hasattr(loop, "create_task"):
+                loop = asyncio.get_running_loop()
+            return loop.create_task(wrapped, name=f'discord.py: {event_name}')
+
+        # Bind the safe scheduler to this instance.
+        self._schedule_event = _safe_schedule_event
     # ── Player registry ───────────────────────────────────────────────────────
 
     def get_player(self, guild_id: int) -> GuildPlayer:
@@ -188,12 +204,22 @@ class MusicBot(commands.Bot):
             self.user.id,
             len(self.guilds),
         )
-        await self.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.listening,
-                name="🎵 Music | /help",
+
+        # Set presence — guard against stale WebSocket on duplicate on_ready
+        try:
+            await self.change_presence(
+                activity=discord.Activity(
+                    type=discord.ActivityType.listening,
+                    name="🎵 Music | /help",
+                )
             )
-        )
+        except Exception as exc:
+            logger.warning("change_presence failed (non-fatal): %s", exc)
+
+        # Run one-time startup logic only on the first on_ready per instance
+        if self._ready_fired:
+            return
+        self._ready_fired = True
 
         # ── P2-3: Auto-restore queues from DB on startup ──────────────────────
         await self._restore_queues_on_startup()
