@@ -505,19 +505,38 @@ async def main() -> None:
         except NotImplementedError:
             pass  # Windows does not support add_signal_handler for all signals
 
-    try:
-        async with bot:
-            await bot.start(config.TOKEN)
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        # Already handled by _shutdown_handler or library
-        pass
-    except Exception as exc:
-        logger.critical("Unexpected error in main: %s", exc, exc_info=True)
+    # Retry loop: handles transient gateway rejections (e.g. Discord OPCODE 9
+    # Invalid Session on first connect) that would otherwise silently kill the bot.
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with bot:
+                await bot.start(config.TOKEN)
+            break  # clean exit — stop retrying
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            logger.warning(
+                "Bot task cancelled (attempt %d/%d) — this usually means a "
+                "transient Discord gateway rejection or a Ctrl+C.",
+                attempt, max_attempts,
+            )
+            if attempt < max_attempts:
+                wait = 5 * attempt
+                logger.info("Retrying in %ds…", wait)
+                await asyncio.sleep(wait)
+            else:
+                logger.error("Max retry attempts reached. Shutting down.")
+        except Exception as exc:
+            logger.critical("Unexpected error in main: %s", exc, exc_info=True)
+            break
 
 
 if __name__ == "__main__":
+    # Windows: ProactorEventLoop (the default) has known incompatibilities with
+    # aiohttp WebSockets used by discord.py — force SelectorEventLoop instead.
+    if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # Final catch for KeyboardInterrupt outside the loop
         pass
