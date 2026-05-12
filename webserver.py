@@ -269,6 +269,8 @@ async def start_webserver(bot: "commands.Bot") -> web.AppRunner:
     A 3-attempt retry loop with exponential back-off handles the rare case
     where the port is still briefly held by the OS between attempts.
     """
+    import asyncio
+
     app = web.Application(middlewares=[error_middleware])
     app[BOT_KEY] = bot
 
