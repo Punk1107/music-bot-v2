@@ -75,11 +75,16 @@ class MusicBot(commands.Bot):
         intents.message_content = True
 
         super().__init__(
-            command_prefix  = "!",
-            intents         = intents,
-            application_id  = config.APP_ID,
-            help_command    = None,
-            case_insensitive= True,
+            command_prefix         = "!",
+            intents                = intents,
+            application_id         = config.APP_ID,
+            help_command           = None,
+            case_insensitive       = True,
+            # Disable automatic member chunk requests at startup.
+            # A music bot does not need a full member roster; this eliminates
+            # the "Shard ID 0 timed out waiting for chunks" warnings that
+            # appear when large guilds don't return chunks in time.
+            chunk_guilds_at_startup = False,
         )
 
         # ── Shared singletons ─────────────────────────────────────────────────
@@ -177,10 +182,17 @@ class MusicBot(commands.Bot):
                 logger.error("Failed to load cog %s: %s", ext, exc, exc_info=True)
 
         # Sync slash commands (global)
+        # NOTE: tree.sync() can hang indefinitely if Discord's API is slow.
+        # Always wrap with a timeout so startup is never blocked.
         if config.SYNC_COMMANDS:
             try:
-                synced = await self.tree.sync()
+                synced = await asyncio.wait_for(self.tree.sync(), timeout=30.0)
                 logger.info("Synced %d application commands.", len(synced))
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Command sync timed out after 30s — commands may not be updated yet. "
+                    "Use !sync in Discord to retry manually."
+                )
             except discord.HTTPException as exc:
                 logger.error("Failed to sync application commands: %s", exc)
         else:
@@ -205,16 +217,20 @@ class MusicBot(commands.Bot):
             len(self.guilds),
         )
 
-        # Set presence — guard against stale WebSocket on duplicate on_ready
-        try:
-            await self.change_presence(
-                activity=discord.Activity(
-                    type=discord.ActivityType.listening,
-                    name="🎵 Music | /help",
+        # Set presence — only when the bot is fully alive (not shutting down).
+        # on_ready can fire a second time from a stale gateway event while the
+        # previous attempt is closing; skip presence in that case to avoid the
+        # "Cannot write to closing transport" warning.
+        if not self._shutdown:
+            try:
+                await self.change_presence(
+                    activity=discord.Activity(
+                        type=discord.ActivityType.listening,
+                        name="🎵 Music | /help",
+                    )
                 )
-            )
-        except Exception as exc:
-            logger.warning("change_presence failed (non-fatal): %s", exc)
+            except Exception as exc:
+                logger.warning("change_presence failed (non-fatal): %s", exc)
 
         # Run one-time startup logic only on the first on_ready per instance
         if self._ready_fired:
