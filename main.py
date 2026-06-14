@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 main.py — Music Bot V2 entry point.
 
@@ -291,6 +291,16 @@ class MusicBot(commands.Bot):
         self._shutdown = True
         logger.info("Shutting down…")
 
+        # ── Cancel background tasks first to avoid 'Task destroyed but pending' ──
+        for bg_task in (self._idle_checker, self._queue_saver):
+            if bg_task.is_running():
+                bg_task.cancel()
+                # Give the task a moment to finish cancellation
+                try:
+                    await asyncio.sleep(0)
+                except Exception:
+                    pass
+
         for guild_id, player in list(self._players.items()):
             try:
                 guild = self.get_guild(guild_id)
@@ -561,11 +571,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    # Windows: ProactorEventLoop (the default) has known incompatibilities with
-    # aiohttp WebSockets used by discord.py — force SelectorEventLoop instead.
-    if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
