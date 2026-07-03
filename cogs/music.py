@@ -784,20 +784,6 @@ class MusicCog(commands.Cog, name="Music"):
         view = SearchSelectView(results, on_select)
         await interaction.followup.send(embed=embed, view=view)
 
-    @app_commands.command(name="queue", description="Show the current queue.")
-    async def queue(self, interaction: discord.Interaction) -> None:
-        if self.service is None:
-            await interaction.response.send_message(
-                embed=info_embed("Queue", "Use the queue cog for the full queue view.")
-            )
-            return
-        tracks = await self.service.get_queue(guild_id=interaction.guild_id)
-        if not tracks:
-            await interaction.response.send_message("Queue is empty.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "\n".join(f"{idx}. {track.title}" for idx, track in enumerate(tracks, 1))
-        )
 
     @app_commands.command(name="pause", description="Pause playback.")
     async def pause(self, interaction: discord.Interaction) -> None:
