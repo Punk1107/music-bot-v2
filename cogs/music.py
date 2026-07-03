@@ -50,6 +50,7 @@ class MusicCog(commands.Cog, name="Music"):
 
     def __init__(self, bot: "MusicBot") -> None:
         self.bot      = bot
+        self.service  = getattr(bot, "service", None)
         self.rate_limiter = RateLimiter()
 
     # ── Guard helpers ─────────────────────────────────────────────────────────
@@ -506,6 +507,17 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.describe(query="YouTube/Spotify URL or search keywords")
     @app_commands.autocomplete(query=_play_autocomplete)
     async def play(self, interaction: discord.Interaction, query: str) -> None:
+        if self.service is not None:
+            await interaction.response.defer(thinking=True)
+            result = await self.service.enqueue_track_by_query(
+                guild_id=interaction.guild_id,
+                channel_id=interaction.user.voice.channel.id,
+                query=query,
+                requester_id=interaction.user.id,
+            )
+            await interaction.followup.send(f"Queued: {result.track.title}")
+            return
+
         # thinking=True shows the animated "Bot is thinking…" spinner during I/O
         await interaction.response.defer(thinking=True)
 
@@ -772,8 +784,28 @@ class MusicCog(commands.Cog, name="Music"):
         view = SearchSelectView(results, on_select)
         await interaction.followup.send(embed=embed, view=view)
 
+    @app_commands.command(name="queue", description="Show the current queue.")
+    async def queue(self, interaction: discord.Interaction) -> None:
+        if self.service is None:
+            await interaction.response.send_message(
+                embed=info_embed("Queue", "Use the queue cog for the full queue view.")
+            )
+            return
+        tracks = await self.service.get_queue(guild_id=interaction.guild_id)
+        if not tracks:
+            await interaction.response.send_message("Queue is empty.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "\n".join(f"{idx}. {track.title}" for idx, track in enumerate(tracks, 1))
+        )
+
     @app_commands.command(name="pause", description="Pause playback.")
     async def pause(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            await self.service.pause_player(interaction.guild.voice_client)
+            await interaction.response.send_message("Paused.")
+            return
+
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
             vc.pause()
@@ -788,6 +820,11 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="resume", description="Resume playback.")
     async def resume(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            await self.service.resume_player(interaction.guild.voice_client)
+            await interaction.response.send_message("Resumed.")
+            return
+
         vc = interaction.guild.voice_client
         if vc and vc.is_paused():
             vc.resume()
@@ -801,6 +838,13 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="skip", description="Skip the current track.")
     async def skip(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            await self.service.skip_track(interaction.guild_id)
+            if interaction.guild.voice_client:
+                interaction.guild.voice_client.stop()
+            await interaction.response.send_message("Skipped.")
+            return
+
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             # Cancel progress task before stopping
@@ -819,6 +863,11 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="stop", description="Stop playback and clear the queue.")
     async def stop(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            await self.service.stop_player(interaction.guild_id, interaction.guild.voice_client)
+            await interaction.response.send_message("Stopped.")
+            return
+
         vc = interaction.guild.voice_client
         player = self.bot.get_player(interaction.guild_id)
         # Cancel the progress-bar task explicitly before reset()

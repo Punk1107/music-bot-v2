@@ -26,11 +26,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _embed_for(message):
+    if message.kind == "error":
+        return error_embed(message.title, message.description)
+    if message.kind == "success":
+        return success_embed(message.title, message.description)
+    return info_embed(message.title, message.description)
+
+
 class EffectsCog(commands.Cog, name="Effects"):
     """Audio effect and volume controls."""
 
-    def __init__(self, bot: "MusicBot") -> None:
+    def __init__(self, bot: "MusicBot", service=None) -> None:
         self.bot = bot
+        self.service = service
 
     # ── Autocomplete ──────────────────────────────────────────────────────────
 
@@ -39,6 +48,11 @@ class EffectsCog(commands.Cog, name="Effects"):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
+        if self.service is not None:
+            return [
+                app_commands.Choice(name=e.display_name, value=e.value)
+                for e in self.service.autocomplete(current)
+            ]
         return [
             app_commands.Choice(name=e.display_name, value=e.value)
             for e in AudioEffect
@@ -50,6 +64,15 @@ class EffectsCog(commands.Cog, name="Effects"):
     @app_commands.command(name="volume", description="Set the playback volume (0-200%).")
     @app_commands.describe(level="Volume level (0–200)")
     async def volume(self, interaction: discord.Interaction, level: int) -> None:
+        if self.service is not None:
+            message = self.service.set_volume(
+                interaction.guild_id,
+                level,
+                getattr(interaction.guild, "voice_client", None),
+            )
+            await interaction.response.send_message(embed=_embed_for(message), ephemeral=message.ephemeral)
+            return
+
         if not (0 <= level <= 200):
             await interaction.response.send_message(
                 embed=error_embed("Invalid Volume", "Volume must be between 0 and 200."),
@@ -77,6 +100,11 @@ class EffectsCog(commands.Cog, name="Effects"):
     @app_commands.describe(effect="Effect to toggle")
     @app_commands.autocomplete(effect=_effect_autocomplete)
     async def effects(self, interaction: discord.Interaction, effect: str) -> None:
+        if self.service is not None:
+            message = await self.service.toggle_effect(interaction.guild_id, effect)
+            await interaction.response.send_message(embed=_embed_for(message), ephemeral=message.ephemeral)
+            return
+
         audio_effect = AudioEffect.from_value(effect)
         if not audio_effect:
             await interaction.response.send_message(
@@ -110,6 +138,11 @@ class EffectsCog(commands.Cog, name="Effects"):
 
     @app_commands.command(name="effects_clear", description="Disable all active audio effects.")
     async def effects_clear(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            message = self.service.clear_effects(interaction.guild_id)
+            await interaction.response.send_message(embed=_embed_for(message), ephemeral=message.ephemeral)
+            return
+
         player = self.bot.get_player(interaction.guild_id)
         if not player.effects:
             await interaction.response.send_message(
@@ -129,6 +162,14 @@ class EffectsCog(commands.Cog, name="Effects"):
 
     @app_commands.command(name="effects_list", description="Show all available audio effects.")
     async def effects_list(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            lines = []
+            for effect, enabled in self.service.list_effects(interaction.guild_id):
+                mark = "on" if enabled else "off"
+                lines.append(f"{mark} {effect.display_name}")
+            await interaction.response.send_message(embed=info_embed("Audio Effects", "\n".join(lines)))
+            return
+
         player = self.bot.get_player(interaction.guild_id)
         active = {e for e in player.effects}
         lines  = []

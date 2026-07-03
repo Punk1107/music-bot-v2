@@ -32,11 +32,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _embed_for(message):
+    if message.kind == "error":
+        return error_embed(message.title, message.description)
+    if message.kind == "success":
+        return success_embed(message.title, message.description)
+    return info_embed(message.title, message.description)
+
+
 class QueueCog(commands.Cog, name="Queue"):
     """Queue management commands."""
 
-    def __init__(self, bot: "MusicBot") -> None:
+    def __init__(self, bot: "MusicBot", service=None) -> None:
         self.bot = bot
+        self.service = service
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -45,6 +54,16 @@ class QueueCog(commands.Cog, name="Queue"):
     async def queue(
         self, interaction: discord.Interaction, page: int = 1
     ) -> None:
+        if self.service is not None:
+            player = self.service.get_queue_state(interaction.guild_id)
+            if player.is_empty() and player.now_playing is None:
+                await interaction.response.send_message(embed=info_embed("Queue Empty", "The queue is currently empty."))
+                return
+            view = QueueView(self.bot, interaction.guild_id, guild_name=interaction.guild.name)
+            view.page = max(1, page)
+            await interaction.response.send_message(embed=view.build_embed(), view=view)
+            return
+
         player = self.bot.get_player(interaction.guild_id)
 
         if player.is_empty() and player.now_playing is None:
@@ -64,6 +83,11 @@ class QueueCog(commands.Cog, name="Queue"):
 
     @app_commands.command(name="shuffle", description="Shuffle the queue randomly.")
     async def shuffle(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            message = await self.service.shuffle(interaction.guild_id)
+            await interaction.response.send_message(embed=_embed_for(message), ephemeral=message.ephemeral)
+            return
+
         player = self.bot.get_player(interaction.guild_id)
         if player.is_empty():
             await interaction.response.send_message(
@@ -78,6 +102,11 @@ class QueueCog(commands.Cog, name="Queue"):
 
     @app_commands.command(name="clear", description="Clear the entire queue.")
     async def clear(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            message = await self.service.clear(interaction.guild_id)
+            await interaction.response.send_message(embed=_embed_for(message), ephemeral=message.ephemeral)
+            return
+
         player = self.bot.get_player(interaction.guild_id)
         count  = len(player)
         await player.clear()
@@ -91,6 +120,11 @@ class QueueCog(commands.Cog, name="Queue"):
 
     @app_commands.command(name="loop", description="Cycle loop mode: Off → Track → Queue.")
     async def loop(self, interaction: discord.Interaction) -> None:
+        if self.service is not None:
+            message = self.service.cycle_loop(interaction.guild_id)
+            await interaction.response.send_message(embed=_embed_for(message), ephemeral=message.ephemeral)
+            return
+
         player = self.bot.get_player(interaction.guild_id)
         player.loop_mode = player.loop_mode.next()
         await interaction.response.send_message(
@@ -100,6 +134,11 @@ class QueueCog(commands.Cog, name="Queue"):
     @app_commands.command(name="remove", description="Remove a track from the queue by position.")
     @app_commands.describe(position="Position in the queue (1-based)")
     async def remove(self, interaction: discord.Interaction, position: int) -> None:
+        if self.service is not None:
+            message = await self.service.remove(interaction.guild_id, position)
+            await interaction.response.send_message(embed=_embed_for(message), ephemeral=message.ephemeral)
+            return
+
         player = self.bot.get_player(interaction.guild_id)
         track  = await player.remove(position - 1)  # Convert to 0-based index
         if track is None:
@@ -129,6 +168,11 @@ class QueueCog(commands.Cog, name="Queue"):
         from_pos: int,
         to_pos: int,
     ) -> None:
+        if self.service is not None:
+            message = await self.service.move(interaction.guild_id, from_pos, to_pos)
+            await interaction.response.send_message(embed=_embed_for(message), ephemeral=message.ephemeral)
+            return
+
         player = self.bot.get_player(interaction.guild_id)
         n = len(player)
 
